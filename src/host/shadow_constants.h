@@ -116,10 +116,12 @@ typedef struct shadow_control_t {
     volatile uint16_t ui_patch_index; /* Requested patch index */
     volatile uint16_t reserved16;
     volatile uint32_t ui_request_id;  /* Incremented on patch request */
-    volatile uint32_t shim_counter;   /* SPI tick counter, incremented post-transfer in shim_post_transfer.
-                                       * Used by shadow_ui for drift correction and by schwung-testd
-                                       * (E2E test bus) as the frame-sync ack primitive. Stable contract;
-                                       * do not remove without updating both consumers. */
+    volatile uint32_t shim_counter;   /* SPI tick counter, incremented in shadow_mix_audio() during
+                                       * shim_pre_transfer — one tick per SPI frame, BEFORE that frame's
+                                       * ioctl runs. Consumers: examples/shadow_poc.c (drift correction
+                                       * in the reference shadow PoC) and src/host/test_daemon/schwung_testd.c
+                                       * (E2E test bus, frame-sync ack primitive). Stable contract; do not
+                                       * remove without updating both consumers. */
     volatile uint8_t selected_slot;   /* Track-selected slot (0-3) for playback/knobs */
     volatile uint8_t shift_held;      /* Is shift button currently held? */
     volatile uint8_t overtake_mode;   /* 0=normal, 1=menu (UI events only), 2=module (all events) */
