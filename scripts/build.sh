@@ -675,6 +675,23 @@ else
     echo "Skipping schwung-heal (up to date)"
 fi
 
+# Build schwung-testd (E2E test-bus daemon, dev/CI only).
+# Opt-in: not started by shim-entrypoint; user runs it manually for testing.
+# Talks to the live shim via existing SHM contracts (control / midi-inject /
+# overlay), exposes a TCP loopback line protocol consumed by pytest-schwung.
+if needs_rebuild build/bin/schwung-testd \
+    src/host/test_daemon/schwung_testd.c \
+    src/host/shadow_constants.h; then
+    echo "Building schwung-testd..."
+    "${CROSS_PREFIX}gcc" -g -O2 \
+        src/host/test_daemon/schwung_testd.c \
+        -o build/bin/schwung-testd \
+        -Isrc/host \
+        -lrt
+else
+    echo "Skipping schwung-testd (up to date)"
+fi
+
 # Copy shadow UI files (always — ExFAT timestamps can confuse cp -u)
 cp ./src/shadow/shadow_ui.js ./build/shadow/
 cp ./src/shadow/*.mjs ./build/shadow/ 2>/dev/null || true

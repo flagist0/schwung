@@ -35,7 +35,7 @@ Cross-compilation uses `${CROSS_PREFIX}gcc` for the Move's ARM architecture.
 
 ## Testing
 
-No automated test suite. Testing is done manually on hardware. After deploying, enable the unified logger and check logs on device:
+Manual testing on hardware is the primary verification path. After deploying, enable the unified logger and check logs on device:
 
 ```bash
 ssh ableton@move.local "touch /data/UserData/schwung/debug_log_on"
@@ -43,6 +43,19 @@ ssh ableton@move.local "tail -f /data/UserData/schwung/debug.log"
 ```
 
 See `docs/LOGGING.md` for the full unified logging guide. In JS use `console.log()` (auto-routed) or import from `shared/logger.mjs`. In C use `LOG_DEBUG("source", "msg")` etc. from `host/unified_log.h`.
+
+### On-device E2E test bus (Phase 1 skeleton)
+
+`schwung-testd` is an opt-in TCP daemon (`bin/schwung-testd` in the tarball) that lets pytest from a dev machine inject MIDI events into Move's MIDI_IN buffer and snapshot shim state — see [flagist0/schwung#2](https://github.com/flagist0/schwung/issues/2) for the full design. Talks to the live shim via existing SHM contracts (`/schwung-control`, `/schwung-midi-inject`, `/schwung-overlay`); no shim modifications. Not started by `shim-entrypoint.sh` — start manually over SSH:
+
+```bash
+ssh ableton@move.local /data/UserData/schwung/bin/schwung-testd
+ssh -L 47777:localhost:47777 ableton@move.local -N   # in another terminal
+pip install -e tools/pytest-schwung
+pytest tests/e2e -v
+```
+
+Phase 1 commands: `PING`, `INJECT_MIDI`, `WAIT_FRAME`, `SNAPSHOT_PAD_LEDS`, `QUIT`. Future phases add streams (MIDI/log/audio), display snapshots via syrupy, module state providers, and a `device_files` SSH-backed fixture. See `tools/pytest-schwung/README.md` for full usage.
 
 ## Device Constraints
 
