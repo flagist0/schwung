@@ -27,8 +27,16 @@ def test_ping(bus):
 def test_wait_frame_advances_counter(bus):
     a = bus.wait_frame(1).counter
     b = bus.wait_frame(2).counter
-    # b should be at least 2 frames past a (counter is monotonic per frame)
-    assert (b - a) >= 2, f"counter only advanced {b - a} in 2 waits"
+    # b should be at least 2 frames past a (counter is monotonic per frame).
+    # Mask to uint32 so that a real shim_counter wrap (every ~14 days at
+    # 344Hz) doesn't make this assertion misbehave under Python's unbounded
+    # int subtraction. Upper bound rejects implausible deltas that would
+    # mask a counter-reset bug as success.
+    delta = (b - a) & 0xFFFFFFFF
+    assert 2 <= delta < 1000, (
+        f"counter delta {delta} out of plausible range "
+        f"(a={a}, b={b}); shim resetting or jitter > 3s"
+    )
 
 
 def test_snapshot_pad_leds_returns_32_bytes(bus):

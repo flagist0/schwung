@@ -166,7 +166,7 @@ static int reply_err(int fd, const char *msg) {
 }
 
 static int cmd_ping(int fd, const char *args) {
-    (void)args;
+    if (args && *args) return reply_err(fd, "PING takes no args");
     return reply(fd, "OK schwung-testd " TESTD_VERSION);
 }
 
@@ -180,12 +180,21 @@ static int cmd_inject_midi(int fd, const char *args) {
     }
 
     /* Append to the inject ring, then bump `ready` so shim picks it up.
-     * Buffer is linear 0..255; write_idx is uint8_t and wraps naturally.
-     * Single-writer for the test bus (sequential), but the shim drain
-     * resets write_idx=0 and zeros the buffer after consuming, so we
-     * must read write_idx fresh per inject. */
+     * Buffer is linear, 256 bytes = 64 packets. The bounds check uses
+     * `>=` (not `>`) so a write that would land write_idx exactly at the
+     * end (256, which would wrap to 0 in uint8_t) is rejected as full —
+     * otherwise the next inject silently overwrites packet[0]. The shim
+     * drain resets write_idx=0 and zeros the buffer after consuming, so
+     * we must read write_idx fresh per inject.
+     *
+     * Single-writer assumption: the daemon, the existing shim writers in
+     * schwung_shim.c (overtake-exit reset path) and any shadow_ui inject
+     * caller all share this ring without CAS. In practice the daemon is
+     * used during testing while the user is not driving the device, so
+     * writers don't collide. Tracked in flagist0/schwung#2 for a real
+     * contract upgrade in a later phase. */
     uint8_t wr = g_inject->write_idx;
-    if ((unsigned)wr + 4u > SHADOW_MIDI_INJECT_BUFFER_SIZE) {
+    if ((unsigned)wr + 4u >= SHADOW_MIDI_INJECT_BUFFER_SIZE) {
         return reply_err(fd, "INJECT_MIDI: inject buffer full, drain not running?");
     }
     g_inject->buffer[wr]     = pkt[0];
@@ -202,7 +211,10 @@ static int cmd_wait_frame(int fd, const char *args) {
     if (!args) return reply_err(fd, "WAIT_FRAME expects N");
     char *end = NULL;
     long n = strtol(args, &end, 10);
-    if (end == args || n < 1 || n > TESTD_WAIT_FRAME_MAX) {
+    /* Require args to consume the entire token: `WAIT_FRAME 5junk` and
+     * `WAIT_FRAME 0x10` (strtol stops at 'x') would otherwise be silently
+     * accepted as 5 / 0. */
+    if (end == args || *end != '\0' || n < 1 || n > TESTD_WAIT_FRAME_MAX) {
         return reply_err(fd, "WAIT_FRAME: N must be 1..10000");
     }
     uint32_t start = g_control->shim_counter;
@@ -210,17 +222,19 @@ static int cmd_wait_frame(int fd, const char *args) {
 
     struct timespec t0, now;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    const long long timeout_ms = (long long)TESTD_WAIT_TIMEOUT_SEC * 1000LL;
     for (;;) {
         uint32_t cur = g_control->shim_counter;
-        /* Use signed delta to handle counter wrap correctly */
+        /* Signed delta handles uint32 wrap correctly. */
         if ((int32_t)(cur - target) >= 0) {
             char line[TESTD_LINE_MAX];
             snprintf(line, sizeof(line), "OK frame=%u", cur);
             return reply(fd, line);
         }
         clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_sec = now.tv_sec - t0.tv_sec;
-        if (elapsed_sec >= TESTD_WAIT_TIMEOUT_SEC) {
+        long long elapsed_ms = (long long)(now.tv_sec - t0.tv_sec) * 1000LL
+                             + (now.tv_nsec - t0.tv_nsec) / 1000000LL;
+        if (elapsed_ms >= timeout_ms) {
             return reply_err(fd, "WAIT_FRAME: timeout (shim not ticking?)");
         }
         usleep(TESTD_WAIT_POLL_USEC);
@@ -228,7 +242,7 @@ static int cmd_wait_frame(int fd, const char *args) {
 }
 
 static int cmd_snapshot_pad_leds(int fd, const char *args) {
-    (void)args;
+    if (args && *args) return reply_err(fd, "SNAPSHOT_PAD_LEDS takes no args");
     uint8_t copy[32];
     /* Volatile copy: shim writes asynchronously on the SPI thread. */
     for (int i = 0; i < 32; i++) {
@@ -260,6 +274,7 @@ static int read_line(int fd, char *out, size_t cap) {
             out[n] = '\0';
             return (int)n;
         }
+        if (c == '\0') return -1;           /* embedded NUL: lossy parse hazard */
         out[n++] = c;
     }
     return -1;                              /* line too long */

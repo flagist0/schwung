@@ -2,8 +2,8 @@
 
 Wraps the v1 line protocol (PING / INJECT_MIDI / WAIT_FRAME / SNAPSHOT_PAD_LEDS
 / QUIT) and exposes both raw primitives and semantic helpers (press_pad,
-release_pad, wait_pad_led_change). The daemon listens on TCP loopback by
-default; reach it from a dev machine via `ssh -L 47777:localhost:47777`.
+release_pad). The daemon listens on TCP loopback by default; reach it from a
+dev machine via `ssh -L 47777:localhost:47777`.
 
 Sequential, single-connection — matches the Phase 1 daemon, which accepts
 one client at a time. Threading and async are out of scope for v1.
@@ -104,7 +104,13 @@ class SchwungBus:
         # Reply is "frame=<counter>" after the OK prefix is stripped
         if not line.startswith("frame="):
             raise SchwungBusError(f"unexpected WAIT_FRAME reply: {line!r}")
-        return WaitFrameResult(counter=int(line.split("=", 1)[1]))
+        try:
+            counter = int(line.split("=", 1)[1])
+        except ValueError as e:
+            raise SchwungBusError(f"unparseable WAIT_FRAME counter: {line!r}") from e
+        if counter < 0:
+            raise SchwungBusError(f"negative frame counter: {counter}")
+        return WaitFrameResult(counter=counter)
 
     def snapshot_pad_leds(self) -> bytes:
         """Return the current 32-byte pad LED color snapshot.
@@ -131,11 +137,18 @@ class SchwungBus:
         # Cable=0 (high nibble), CIN=9 (note-on, low nibble) -> 0x09
         self.inject_midi(bytes([0x09, 0x90, note, velocity]))
 
-    def release_pad(self, note: int) -> None:
-        """Inject a note-off for a pad on cable 0, channel 0."""
+    def release_pad(self, note: int, velocity: int = 0x40) -> None:
+        """Inject a note-off for a pad on cable 0, channel 0.
+
+        ``velocity`` is the release velocity (0..127). Default 0x40 matches
+        the standard "no release-velocity sensor" value; pass a real
+        velocity if the test exercises a release-velocity-aware module.
+        """
         _check_pad_note(note)
+        if not 0 <= velocity <= 127:
+            raise ValueError("release velocity must be 0..127")
         # CIN=8 (note-off), status 0x80
-        self.inject_midi(bytes([0x08, 0x80, note, 0x40]))
+        self.inject_midi(bytes([0x08, 0x80, note, velocity]))
 
     def pad_index(self, note: int) -> int:
         """Convert a pad note (68..99) to its pad_led_colors index (0..31)."""
@@ -154,13 +167,17 @@ class SchwungBus:
             raise SchwungBusError("bus not connected")
         self._send_line(command)
         line = self._read_line()
-        if line.startswith("OK"):
-            # Strip "OK" and optional trailing payload
-            rest = line[2:].lstrip()
-            return rest
-        if line.startswith("ERR"):
-            raise SchwungBusError(line[3:].lstrip() or "ERR (no message)")
+        # Token-match (not prefix-match) so a hypothetical "OKAY foo" or
+        # "ERROR bad" reply doesn't get silently mis-routed as success/error.
+        if line == "OK" or line.startswith("OK "):
+            return line[2:].lstrip()
+        if line == "ERR" or line.startswith("ERR "):
+            return self._raise_err(line[3:].lstrip())
         raise SchwungBusError(f"protocol error: unexpected reply {line!r}")
+
+    @staticmethod
+    def _raise_err(msg: str) -> str:
+        raise SchwungBusError(msg or "ERR (no message)")
 
     def _send_line(self, line: str) -> None:
         assert self._sock is not None
