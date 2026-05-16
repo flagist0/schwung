@@ -160,7 +160,21 @@ static int open_listener(const char *bind_addr, int port) {
  * -------------------------------------------------------------------------- */
 
 static volatile sig_atomic_t g_stop = 0;
-static void on_signal(int sig) { (void)sig; g_stop = 1; }
+static volatile int g_listen_fd = -1;  /* main writes once; signal handler reads */
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_stop = 1;
+    /* Close the listening socket so accept() returns immediately with
+     * EBADF; the loop checks g_stop and exits cleanly. Without this,
+     * accept() blocks indefinitely and SIGTERM has no effect — forcing
+     * SIGKILL during hot-swap. close() is async-signal-safe per POSIX. */
+    int fd = g_listen_fd;
+    if (fd >= 0) {
+        g_listen_fd = -1;
+        close(fd);
+    }
+}
 
 int main(int argc, char **argv) {
     const char *bind_addr = getenv("SCHWUNG_TEST_BIND");
@@ -193,6 +207,7 @@ int main(int argc, char **argv) {
 
     int srv = open_listener(bind_addr, port);
     if (srv < 0) return 1;
+    g_listen_fd = srv;
 
     fprintf(stderr, "schwung-testd %s listening on %s:%d\n",
             TESTD_VERSION, bind_addr, port);
@@ -203,6 +218,10 @@ int main(int argc, char **argv) {
         int c = accept(srv, (struct sockaddr *)&ca, &cal);
         if (c < 0) {
             if (errno == EINTR) continue;
+            if (g_stop && (errno == EBADF || errno == EINVAL)) {
+                /* Signal handler closed srv to break us out — clean exit. */
+                break;
+            }
             perror("accept");
             break;
         }
@@ -219,6 +238,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "schwung-testd: client disconnected\n");
     }
 
-    close(srv);
+    /* Signal handler may have already closed srv; close() on -1 is a
+     * no-op error. Either way, drop the global so a late signal can't
+     * race a fresh fd if main() were ever restarted in-process. */
+    int fd = g_listen_fd;
+    g_listen_fd = -1;
+    if (fd >= 0) close(fd);
     return 0;
 }
