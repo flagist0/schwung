@@ -681,13 +681,17 @@ fi
 # overlay), exposes a TCP loopback line protocol consumed by pytest-schwung.
 if needs_rebuild build/bin/schwung-testd \
     src/host/test_daemon/schwung_testd.c \
+    src/host/test_daemon/commands.c src/host/test_daemon/commands.h \
+    src/host/test_daemon/protocol.c src/host/test_daemon/protocol.h \
     src/host/shadow_constants.h \
     src/host/shadow_midi_inject_writer.h; then
     echo "Building schwung-testd..."
     "${CROSS_PREFIX}gcc" -g -O2 \
         src/host/test_daemon/schwung_testd.c \
+        src/host/test_daemon/commands.c \
+        src/host/test_daemon/protocol.c \
         -o build/bin/schwung-testd \
-        -Isrc/host \
+        -Isrc/host -Isrc/host/test_daemon \
         -lrt
 else
     echo "Skipping schwung-testd (up to date)"
