@@ -22,3 +22,13 @@ build/cache/
 *.asd
 move_audio_recv
 libs/memfault-firmware-sdk/
+
+# Python (pytest-schwung tooling)
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Local-only Claude Code config (agents used ad-hoc for review rounds)
+.claude/agents/
