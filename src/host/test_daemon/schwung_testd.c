@@ -212,6 +212,10 @@ int main(int argc, char **argv) {
                 ip, ntohs(ca.sin_port));
         serve_client(c);
         close(c);
+        /* Unconditionally drop per-client state so a dropped TCP
+         * connection (without QUIT) doesn't leak a stale subscription
+         * into the next client's first DUMP. See commands.h. */
+        commands_reset_client_state();
         fprintf(stderr, "schwung-testd: client disconnected\n");
     }
 

@@ -39,29 +39,44 @@ def test_capture_context_manager(bus):
 def test_pad_press_emits_note_events(bus, midi_out_capture):
     """A pad press should produce at least one MIDI event on cable 0 if any
     Move track is armed (default behavior). If no events arrive at all,
-    the capture path is broken regardless of which module is loaded."""
+    the capture path is broken regardless of which module is loaded.
+
+    We bracket the press with a 4-frame baseline drain so a totally empty
+    capture pinpoints the capture path itself (not a "no events because
+    no armed track" race) — if even the baseline drain is empty AND
+    nothing arrives after the press, that's a real bug we want to know.
+    """
     note = 84  # mid-grid pad
+
+    # Baseline: are we observing anything at all from the device?
+    bus.wait_frame(4)
+    baseline = midi_out_capture.drain()
 
     bus.press_pad(note, velocity=100)
     bus.wait_frame(8)
     bus.release_pad(note)
     bus.wait_frame(8)
+    after = midi_out_capture.drain()
 
-    # Drain mid-test (the fixture also drains at teardown, but this lets
-    # us assert before the test ends).
-    cap = bus.dump_midi_out()
-
-    if len(cap) == 0:
-        pytest.skip(
-            "No MIDI_OUT events seen after pad press — Move likely has "
-            "no armed track. Arm a track or load a module that emits MIDI."
+    if len(after) == 0 and len(baseline) == 0:
+        pytest.fail(
+            "No MIDI_OUT events seen at any point — capture path looks "
+            "broken (shim not publishing, or daemon not subscribing). "
+            "Verify shim is running and SHM segment exists."
         )
 
-    # Sanity: at least one note-related event on cable 0
-    notes = cap.filter(cable=0, kind="note_on") + cap.filter(cable=0, kind="note_off")
-    assert len(notes.events) > 0, (
+    if len(after) == 0:
+        pytest.skip(
+            "Capture path works (baseline saw events) but the pad press "
+            "produced none — likely no armed track. Arm a track or load "
+            "a module that emits MIDI."
+        )
+
+    notes = after.filter(cable=0, kind="note_on").events \
+          + after.filter(cable=0, kind="note_off").events
+    assert len(notes) > 0, (
         f"Pad press produced events but none were note-on/off on cable 0. "
-        f"Got: {[e.kind for e in cap.events[:10]]}"
+        f"Got kinds: {[e.kind for e in after.events[:10]]}"
     )
 
 
@@ -80,7 +95,7 @@ def test_no_stuck_notes_after_pad_press_release(bus, midi_out_capture):
     bus.release_pad(note)
     bus.wait_frame(20)  # ample headroom for any deferred note-off
 
-    cap = bus.dump_midi_out()
+    cap = midi_out_capture.drain()
     if len(cap) == 0:
         pytest.skip(
             "No MIDI_OUT seen during press/release — likely no armed "
@@ -91,13 +106,10 @@ def test_no_stuck_notes_after_pad_press_release(bus, midi_out_capture):
     note_ons  = cap.filter(kind="note_on",  note=note).events
     note_offs = cap.filter(kind="note_off", note=note).events
 
-    # We also accept note-on with velocity 0 as a logical note-off
-    # (running-status convention some firmwares use).
-    implicit_offs = [
-        e for e in cap.filter(kind="note_on", note=note).events
-        if e.data2 == 0
-    ]
-    real_ons = [e for e in note_ons if e.data2 > 0]
+    # Note-on with velocity 0 is a logical note-off (running-status
+    # convention some firmwares use).
+    implicit_offs = [e for e in note_ons if e.data2 == 0]
+    real_ons      = [e for e in note_ons if e.data2 > 0]
 
     total_offs = len(note_offs) + len(implicit_offs)
     total_ons  = len(real_ons)
@@ -121,11 +133,12 @@ def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
     bus.release_pad(pad_t1)
     bus.wait_frame(6)
 
-    # Simulate track-button press by injecting CC 43 (track 1) -> 40 (track 4).
-    # See CLAUDE.md: "Tracks: CCs 40-43 (reversed: CC43=Track1, CC40=Track4)".
-    # We don't have a press_track helper yet; use raw inject.
+    # Simulate track-button press by injecting CC 40 (Track 4 per
+    # CLAUDE.md: "Tracks: CCs 40-43, reversed: CC43=Track1, CC40=Track4").
+    # Hold for 8 frames (~23 ms) so Move's UI poller sees a real press
+    # rather than a debounced bounce.
     bus.inject_midi(bytes([0x0B, 0xB0, 40, 127]))  # CC 40 (Track 4) on
-    bus.wait_frame(2)
+    bus.wait_frame(8)
     bus.inject_midi(bytes([0x0B, 0xB0, 40, 0]))    # CC 40 release
     bus.wait_frame(10)
 
@@ -134,7 +147,7 @@ def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
     bus.release_pad(pad_t4)
     bus.wait_frame(20)
 
-    cap = bus.dump_midi_out()
+    cap = midi_out_capture.drain()
     if len(cap) == 0:
         pytest.skip("No MIDI_OUT — no armed tracks?")
 

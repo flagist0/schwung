@@ -4,11 +4,12 @@ Fixtures:
   ``bus``               session-scoped SchwungBus, connected and
                         ping-validated. Auto-skips collected tests if
                         the daemon is unreachable.
-  ``midi_out_capture``  function-scoped capture of MIDI_OUT events that
-                        happened during the test body. Yields a
-                        MidiOutCaptureContext whose `.events` is populated
-                        after the test runs — but tests can also use the
-                        context's bus methods directly for finer control.
+  ``midi_out_capture``  function-scoped MidiOutSession. The fixture
+                        subscribes on setup, yields a session handle,
+                        unsubscribes on teardown. Tests call
+                        ``session.drain()`` to read captured events
+                        (multiple times in one test is fine — each drain
+                        returns events since the last).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import socket
 
 import pytest
 
-from .client import SchwungBus, SchwungBusError, MidiOutCaptureContext
+from .client import SchwungBus, SchwungBusError, MidiOutSession
 
 
 @pytest.fixture(scope="session")
@@ -36,32 +37,26 @@ def bus() -> SchwungBus:
 
 
 @pytest.fixture
-def midi_out_capture(bus) -> MidiOutCaptureContext:
-    """Capture MIDI_OUT events emitted during the test.
+def midi_out_capture(bus) -> MidiOutSession:
+    """Subscribe to MIDI_OUT events for the duration of one test.
 
-    Tests treat this as a live handle to the capture: events are not yet
-    populated when the fixture is entered; they're populated when the
-    test calls `cap.events = bus.dump_midi_out()` explicitly, OR when
-    the fixture's teardown drains automatically.
+    Yields a MidiOutSession. Call ``session.drain()`` (or the equivalent
+    shorter ``session()``) to read events captured since the last drain
+    (or since subscribe). The fixture handles unsubscribe on teardown,
+    so failing tests don't leak the subscription into the next test.
 
     Typical use::
 
         def test_no_stuck_notes(bus, midi_out_capture):
             bus.press_pad(84); bus.wait_frame(8)
             bus.release_pad(84); bus.wait_frame(8)
-            cap = bus.dump_midi_out()  # snapshot before exit
+            cap = midi_out_capture.drain()
             assert len(cap.filter(kind="note_off")) >= len(cap.filter(kind="note_on"))
     """
     bus.subscribe_midi_out()
-    ctx = MidiOutCaptureContext(bus)
-    ctx._bus = bus  # already subscribed; suppress re-subscribe on enter
     try:
-        yield ctx
+        yield MidiOutSession(bus)
     finally:
-        try:
-            ctx.events = bus.dump_midi_out()
-        except Exception:
-            pass
         try:
             bus.unsubscribe_midi_out()
         except Exception:

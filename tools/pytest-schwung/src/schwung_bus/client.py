@@ -225,6 +225,10 @@ class SchwungBus:
         Advances the baseline so the next call returns only new events.
         `dropped` is non-zero if the ring overflowed (1024 events fit) —
         bump TEST_STREAM_CAPACITY in shadow_constants.h if you hit it.
+
+        Wraps every parser failure in SchwungBusError (not raw ValueError)
+        so callers get a consistent exception type and a message that
+        names what went wrong on the wire.
         """
         if self._sock is None:
             raise SchwungBusError("bus not connected")
@@ -234,23 +238,43 @@ class SchwungBus:
             if header.startswith("ERR"):
                 raise SchwungBusError(header[3:].lstrip() or "ERR (no message)")
             raise SchwungBusError(f"unexpected DUMP_MIDI_OUT reply: {header!r}")
-        # Parse "OK count=N dropped=D"
+
+        # Parse "OK count=N dropped=D" — count is required.
         rest = header[2:].lstrip()
-        count = 0
+        count: Optional[int] = None
         dropped = 0
         for tok in rest.split():
             if tok.startswith("count="):
-                count = int(tok[6:])
+                try:
+                    count = int(tok[6:])
+                except ValueError as e:
+                    raise SchwungBusError(f"DUMP_MIDI_OUT bad count token: {tok!r}") from e
             elif tok.startswith("dropped="):
-                dropped = int(tok[8:])
+                try:
+                    dropped = int(tok[8:])
+                except ValueError as e:
+                    raise SchwungBusError(f"DUMP_MIDI_OUT bad dropped token: {tok!r}") from e
+        if count is None:
+            raise SchwungBusError(f"DUMP_MIDI_OUT header missing count=: {header!r}")
+        if count < 0 or dropped < 0:
+            raise SchwungBusError(f"DUMP_MIDI_OUT negative count/dropped: {header!r}")
+
         events: List[MidiOutEvent] = []
         for _ in range(count):
             line = self._read_line()
             if not line.startswith("EV "):
                 raise SchwungBusError(f"expected EV line, got {line!r}")
-            _, frame_hex, pkt_hex = line.split()
-            frame = int(frame_hex, 16)
-            pkt = bytes.fromhex(pkt_hex)
+            parts = line.split()
+            if len(parts) != 3:
+                raise SchwungBusError(
+                    f"malformed EV line (expected 'EV <frame> <pkt>'): {line!r}"
+                )
+            _, frame_hex, pkt_hex = parts
+            try:
+                frame = int(frame_hex, 16)
+                pkt = bytes.fromhex(pkt_hex)
+            except ValueError as e:
+                raise SchwungBusError(f"bad EV hex in {line!r}: {e}") from e
             if len(pkt) != 4:
                 raise SchwungBusError(f"EV packet must be 4 bytes, got {len(pkt)}")
             events.append(MidiOutEvent(
@@ -354,14 +378,38 @@ def _check_pad_note(note: int) -> None:
         raise ValueError(f"pad note must be 68..99, got {note}")
 
 
+class MidiOutSession:
+    """Live MIDI_OUT subscription handle — `drain()` returns events
+    captured since the last drain (or since the session started).
+
+    Used by the `midi_out_capture` pytest fixture. The fixture
+    subscribes on setup, yields the session, drains-and-unsubscribes on
+    teardown. Tests call `session.drain()` (or the shorter `session()`,
+    which is equivalent) to assert on captured events mid-test.
+
+    For non-pytest usage prefer `SchwungBus.capture_midi_out()` (a
+    context manager).
+    """
+    def __init__(self, bus: "SchwungBus") -> None:
+        self._bus = bus
+
+    def drain(self) -> MidiOutCapture:
+        return self._bus.dump_midi_out()
+
+    def __call__(self) -> MidiOutCapture:
+        return self.drain()
+
+
 class MidiOutCaptureContext:
     """Context manager returned by SchwungBus.capture_midi_out().
 
-    On enter: calls subscribe_midi_out().
-    On exit:  calls dump_midi_out() (so the result is available via .events
-              after the `with` block) and unsubscribe_midi_out().
+    Subscribes on enter, drains-and-unsubscribes on exit. The captured
+    events are exposed as `.events` (a MidiOutCapture) AFTER the
+    `with` block.
 
-    The captured events are exposed as `.events` (a MidiOutCapture).
+    Use this for one-shot scripts and the API examples in the README.
+    Inside pytest, prefer the `midi_out_capture` fixture which yields a
+    `MidiOutSession` (no implicit __enter__/__exit__ confusion).
     """
     def __init__(self, bus: "SchwungBus") -> None:
         self._bus = bus

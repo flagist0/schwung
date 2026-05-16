@@ -30,6 +30,10 @@ typedef struct daemon_shm {
  * commands_dispatch(). */
 void commands_init(const daemon_shm_t *shm);
 
+/* Reset per-client subscription state. Called on connection close so
+ * the next client doesn't inherit a stale baseline from a dropped one. */
+void commands_reset_client_state(void);
+
 /* Dispatch a single command line to its handler.
  * Returns the handler's return code (see commands.h docblock above). */
 int commands_dispatch(int fd, const char *verb, const char *args);

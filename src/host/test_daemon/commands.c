@@ -35,6 +35,20 @@ void commands_init(const daemon_shm_t *shm) {
     g_shm = *shm;
 }
 
+/* Forward decls so commands_reset_client_state can clear stream state
+ * before the per-stream globals are defined below. */
+static void midi_out_subscription_reset(void);
+
+void commands_reset_client_state(void) {
+    /* Called from schwung_testd.c after a client disconnects. Disables
+     * any subscriptions the prior client opened so the next client
+     * starts from a clean slate — without this, a dropped TCP
+     * connection (network blip, killed test runner, exception that
+     * bypassed QUIT) leaves the shim publishing into a ring we'd then
+     * misinterpret as "events captured for the new client." */
+    midi_out_subscription_reset();
+}
+
 /* ---- handlers ---------------------------------------------------------- */
 
 static int cmd_ping(int fd, const char *args) {
@@ -117,9 +131,19 @@ static int cmd_snapshot_pad_leds(int fd, const char *args) {
 /* Per-subscriber baseline: the write_seq value at the moment of
  * SUBSCRIBE_MIDI_OUT (or the most recent DUMP_MIDI_OUT). Events after
  * this point haven't been delivered yet. Single global because the
- * daemon serves one client at a time. */
+ * daemon serves one client at a time; commands_reset_client_state()
+ * clears it on disconnect so the next client doesn't inherit stale
+ * baselines. */
 static uint32_t g_midi_out_baseline = 0;
 static int      g_midi_out_subscribed = 0;
+
+static void midi_out_subscription_reset(void) {
+    if (g_shm.midi_out_stream) {
+        __atomic_store_n(&g_shm.midi_out_stream->enabled, 0, __ATOMIC_RELEASE);
+    }
+    g_midi_out_subscribed = 0;
+    g_midi_out_baseline = 0;
+}
 
 static int cmd_subscribe_midi_out(int fd, const char *args) {
     if (args && *args) return protocol_reply_err(fd, "SUBSCRIBE_MIDI_OUT takes no args");
@@ -160,6 +184,19 @@ static int cmd_dump_midi_out(int fd, const char *args) {
     /* ACQUIRE pairs with shim's RELEASE on write_seq → buffer writes
      * are visible to us. */
     uint32_t cur = __atomic_load_n(&s->write_seq, __ATOMIC_ACQUIRE);
+
+    /* Detect shim restart / SHM reset: if cur is BEFORE our baseline
+     * (signed delta negative), the underlying write_seq was zeroed
+     * while we held an old value. Treat as a fresh start: re-baseline
+     * silently and return empty. Otherwise the unsigned subtraction
+     * below would wrap to ~4 billion and we'd report nonsense
+     * `dropped` plus 1024 garbage events from the buffer. */
+    if ((int32_t)(cur - g_midi_out_baseline) < 0) {
+        g_midi_out_baseline = cur;
+        if (protocol_reply(fd, "OK count=0 dropped=0") < 0) return -1;
+        return protocol_reply(fd, "END");
+    }
+
     uint32_t delta = cur - g_midi_out_baseline;
     uint32_t to_read = delta;
     uint32_t dropped = 0;
@@ -195,14 +232,9 @@ static int cmd_dump_midi_out(int fd, const char *args) {
 
 static int cmd_quit(int fd, const char *args) {
     (void)args;
-    /* On disconnect, leave the shim's stream capture running (idempotent,
-     * cheap) — main() will exit the process anyway when the client
-     * disconnects? No — main keeps listening. Disable so the shim's
-     * write_seq doesn't drift while no one's draining. */
-    if (g_midi_out_subscribed && g_shm.midi_out_stream) {
-        __atomic_store_n(&g_shm.midi_out_stream->enabled, 0, __ATOMIC_RELEASE);
-        g_midi_out_subscribed = 0;
-    }
+    /* Symmetric with the post-disconnect cleanup in schwung_testd.c —
+     * either path leaves the shim with no live subscription. */
+    midi_out_subscription_reset();
     protocol_reply(fd, "OK bye");
     return 1;  /* signal: close connection after this reply */
 }

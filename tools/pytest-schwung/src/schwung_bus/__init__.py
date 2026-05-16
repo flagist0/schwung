@@ -5,6 +5,7 @@ from .client import (
     MidiOutEvent,
     MidiOutCapture,
     MidiOutCaptureContext,
+    MidiOutSession,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "MidiOutEvent",
     "MidiOutCapture",
     "MidiOutCaptureContext",
+    "MidiOutSession",
 ]
