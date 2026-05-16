@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include "shadow_constants.h"
+#include "shadow_midi_inject_writer.h"
 
 #define TESTD_VERSION  "0.1.0"
 #define TESTD_DEFAULT_PORT 47777
@@ -179,31 +180,16 @@ static int cmd_inject_midi(int fd, const char *args) {
         return reply_err(fd, "INJECT_MIDI: bad hex");
     }
 
-    /* Append to the inject ring, then bump `ready` so shim picks it up.
-     * Buffer is linear, 256 bytes = 64 packets. The bounds check uses
-     * `>=` (not `>`) so a write that would land write_idx exactly at the
-     * end (256, which would wrap to 0 in uint8_t) is rejected as full —
-     * otherwise the next inject silently overwrites packet[0]. The shim
-     * drain resets write_idx=0 and zeros the buffer after consuming, so
-     * we must read write_idx fresh per inject.
-     *
-     * Single-writer assumption: the daemon, the existing shim writers in
-     * schwung_shim.c (overtake-exit reset path) and any shadow_ui inject
-     * caller all share this ring without CAS. In practice the daemon is
-     * used during testing while the user is not driving the device, so
-     * writers don't collide. Tracked in flagist0/schwung#2 for a real
-     * contract upgrade in a later phase. */
-    uint8_t wr = g_inject->write_idx;
-    if ((unsigned)wr + 4u >= SHADOW_MIDI_INJECT_BUFFER_SIZE) {
+    /* All four producers (shim, shadow_ui, shadow_chain forwarder, this
+     * daemon) share /schwung-midi-inject. Coordination lives in the
+     * MPSC helper — see src/host/shadow_midi_inject_writer.h. */
+    int rc = shadow_midi_inject_push(g_inject, pkt);
+    if (rc == -1) {
         return reply_err(fd, "INJECT_MIDI: inject buffer full, drain not running?");
     }
-    g_inject->buffer[wr]     = pkt[0];
-    g_inject->buffer[wr + 1] = pkt[1];
-    g_inject->buffer[wr + 2] = pkt[2];
-    g_inject->buffer[wr + 3] = pkt[3];
-    __sync_synchronize();
-    g_inject->write_idx = (uint8_t)(wr + 4);
-    g_inject->ready++;
+    if (rc == -2) {
+        return reply_err(fd, "INJECT_MIDI: prior producer stranded, packet not committed");
+    }
     return reply(fd, "OK");
 }
 

@@ -256,7 +256,7 @@ if needs_rebuild build/schwung-shim.so \
     src/host/shadow_led_queue.c src/host/shadow_fd_trace.c src/host/shadow_state.c \
     src/host/shadow_midi.c src/host/unified_log.c \
     $SHIM_TTS_SRC \
-    src/host/shadow_constants.h src/host/shadow_midi.h src/host/shadow_sampler.h \
+    src/host/shadow_constants.h src/host/shadow_midi_inject_writer.h src/host/shadow_midi.h src/host/shadow_sampler.h \
     src/host/shadow_set_pages.h src/host/shadow_dbus.h src/host/shadow_chain_mgmt.h \
     src/host/shadow_chain_types.h src/host/shadow_link_audio.h src/host/shadow_process.h \
     src/host/shadow_resample.h src/host/shadow_overlay.h src/host/shadow_pin_scanner.h \
@@ -681,7 +681,8 @@ fi
 # overlay), exposes a TCP loopback line protocol consumed by pytest-schwung.
 if needs_rebuild build/bin/schwung-testd \
     src/host/test_daemon/schwung_testd.c \
-    src/host/shadow_constants.h; then
+    src/host/shadow_constants.h \
+    src/host/shadow_midi_inject_writer.h; then
     echo "Building schwung-testd..."
     "${CROSS_PREFIX}gcc" -g -O2 \
         src/host/test_daemon/schwung_testd.c \
