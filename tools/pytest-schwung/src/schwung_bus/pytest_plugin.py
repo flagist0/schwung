@@ -19,6 +19,7 @@ import socket
 import pytest
 
 from .client import SchwungBus, SchwungBusError, MidiOutSession
+from .commander import Commander
 
 
 @pytest.fixture(scope="session")
@@ -34,6 +35,23 @@ def bus() -> SchwungBus:
         )
     yield b
     b.close()
+
+
+@pytest.fixture
+def commander(bus) -> Commander:
+    """Command-pattern stack for UI tests.
+
+    Yields a Commander. Tests build state by calling ``commander.do(cmd)``;
+    the fixture's teardown calls ``commander.undo_all()`` to reverse
+    every action in LIFO order — even if the test failed mid-way.
+
+    See ``schwung_bus.move_commands`` for concrete commands.
+    """
+    c = Commander(bus=bus)
+    try:
+        yield c
+    finally:
+        c.undo_all()
 
 
 @pytest.fixture

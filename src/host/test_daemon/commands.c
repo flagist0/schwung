@@ -167,6 +167,26 @@ static int cmd_snapshot_pad_leds(int fd, const char *args) {
     return protocol_reply(fd, line);
 }
 
+/* STATE — single-line snapshot of selected shadow_control_t fields used
+ * as precondition checks by Command-pattern UI tests (Phase 3). Fields
+ * are space-separated `key=value` tokens; extend as commands need more.
+ * Read-only, no side effects. */
+static int cmd_state(int fd, const char *args) {
+    if (args && *args) return protocol_reply_err(fd, "STATE takes no args");
+    shadow_control_t *c = g_shm.control;
+    char line[TESTD_LINE_MAX];
+    snprintf(line, sizeof(line),
+             "OK move_ui_mode=%u overtake_mode=%u shift_held=%u "
+             "selected_slot=%u ui_slot=%u shim_counter=%u",
+             (unsigned)c->move_ui_mode,
+             (unsigned)c->overtake_mode,
+             (unsigned)c->shift_held,
+             (unsigned)c->selected_slot,
+             (unsigned)c->ui_slot,
+             (unsigned)c->shim_counter);
+    return protocol_reply(fd, line);
+}
+
 /* ---- channel-parametric stream commands ------------------------------- */
 
 static int cmd_subscribe(int fd, const char *args) {
@@ -267,6 +287,7 @@ static const command_entry_t g_commands[] = {
     {"INJECT_MIDI",       cmd_inject_midi},
     {"WAIT_FRAME",        cmd_wait_frame},
     {"SNAPSHOT_PAD_LEDS", cmd_snapshot_pad_leds},
+    {"STATE",             cmd_state},
     {"SUBSCRIBE",         cmd_subscribe},
     {"UNSUBSCRIBE",       cmd_unsubscribe},
     {"DUMP",              cmd_dump},

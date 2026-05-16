@@ -33,6 +33,51 @@ class WaitFrameResult:
 
 
 @dataclass
+class BusState:
+    """Snapshot of selected ``shadow_control_t`` fields.
+
+    Used as the precondition source for Command-pattern UI tests
+    (Phase 3) — commands inspect this to decide whether the system
+    is in a valid state for the action they're about to take.
+
+    Fields are coarse on purpose: we extend the daemon's STATE
+    response (and the shim's enum, if needed) one field at a time
+    as commands need more granularity. Display-diff is never used
+    for preconditions — too fragile.
+    """
+    move_ui_mode: int      # 0=unknown, 1=session, 2=note, 3=set_overview
+    overtake_mode: int     # 0=normal, 1=menu, 2=module (schwung overlay)
+    shift_held: int        # 0/1 — modifier
+    selected_slot: int     # 0..3 — schwung slot focus
+    ui_slot: int           # 0..3 — schwung slot for knob routing
+    shim_counter: int      # SPI tick counter at moment of probe
+
+    # Enum mirrors for readability in tests.
+    MOVE_UI_UNKNOWN      = 0
+    MOVE_UI_SESSION      = 1
+    MOVE_UI_NOTE         = 2
+    MOVE_UI_SET_OVERVIEW = 3
+
+    OVERTAKE_NORMAL = 0
+    OVERTAKE_MENU   = 1
+    OVERTAKE_MODULE = 2
+
+    def in_move_native(self) -> bool:
+        """True if Move's own UI is active (not schwung overlay)."""
+        return self.overtake_mode == self.OVERTAKE_NORMAL
+
+
+# Move button -> CC# mapping for bus.tap(). Add new names sparingly;
+# this is a stable surface that tests rely on.
+_BUTTON_CCS = {
+    "jog_click": 3,
+    "shift":     49,
+    "menu":      50,
+    "back":      51,
+}
+
+
+@dataclass
 class MidiOutEvent:
     """One USB-MIDI packet observed in Move's MIDI_OUT by the shim."""
     frame: int       # shim_counter at capture time
@@ -344,6 +389,55 @@ class SchwungBus:
         """Convert a pad note (68..99) to its pad_led_colors index (0..31)."""
         _check_pad_note(note)
         return note - 68
+
+    # ----- state probe (Phase 3, used as command preconditions) -------------
+
+    def state(self) -> BusState:
+        """One-shot snapshot of shim/control state for preconditions.
+
+        Read-only, no side effects. Extend the daemon's STATE response
+        (and this parser) one field at a time as new commands need
+        more precondition granularity.
+        """
+        line = self._request("STATE")
+        fields: dict[str, int] = {}
+        for tok in line.split():
+            if "=" not in tok:
+                raise SchwungBusError(f"STATE: malformed token {tok!r}")
+            k, v = tok.split("=", 1)
+            try:
+                fields[k] = int(v)
+            except ValueError as e:
+                raise SchwungBusError(f"STATE: non-integer {k}={v!r}") from e
+        try:
+            return BusState(
+                move_ui_mode=fields["move_ui_mode"],
+                overtake_mode=fields["overtake_mode"],
+                shift_held=fields["shift_held"],
+                selected_slot=fields["selected_slot"],
+                ui_slot=fields["ui_slot"],
+                shim_counter=fields["shim_counter"],
+            )
+        except KeyError as e:
+            raise SchwungBusError(f"STATE: missing field {e}") from e
+
+    # ----- button helpers ---------------------------------------------------
+
+    def tap(self, button: str, hold_frames: int = 2) -> None:
+        """Press + release a Move button via CC injection on cable 0.
+
+        Known buttons: jog_click, shift, menu, back. Add more in
+        ``_BUTTON_CCS`` as commands need them — keep the surface
+        explicit so a typo fails loudly.
+        """
+        cc = _BUTTON_CCS.get(button)
+        if cc is None:
+            raise ValueError(
+                f"unknown button {button!r}; known: {sorted(_BUTTON_CCS)}"
+            )
+        self.inject_midi(bytes([0x0B, 0xB0, cc, 127]))
+        self.wait_frame(hold_frames)
+        self.inject_midi(bytes([0x0B, 0xB0, cc, 0]))
 
     # ----- internals ---------------------------------------------------------
 

@@ -108,6 +108,38 @@ with SchwungBus() as bus:
           [i for i in range(32) if before[i] != after[i]])
 ```
 
+### Command pattern for reversible UI tests (Phase 3)
+
+UI tests mutate Move's state. To stay isolated, each test should
+undo what it did — preferably automatically. The `Commander` pattern
+makes this declarative:
+
+```py
+from schwung_bus.move_commands import EnterTrackMenu, TapButton
+
+def test_track_menu_does_something(bus, commander):
+    commander.do(EnterTrackMenu())   # tap jog click
+    commander.do(TapButton("menu"))  # do something in the menu
+    # ... assertions ...
+    # At test teardown, commander.undo_all() reverses everything LIFO:
+    # first un-taps "menu", then taps "back" to close the track menu.
+```
+
+Each `Command` has:
+- `precondition(bus, commander)` — raise `PreconditionError` if the
+  system isn't in a valid state. Catches state drift loudly.
+- `execute(bus, commander)` — apply the action.
+- `undo(bus, commander)` — reverse it.
+
+Preconditions consult `bus.state()` (a `BusState` snapshot of shim
+state — `move_ui_mode`, `overtake_mode`, etc.). When a test needs
+finer granularity than `state()` exposes, we extend the daemon's
+STATE command and the shim's tracking one field at a time.
+
+The `commander` fixture handles teardown. Failures during `undo_all()`
+raise `UndoError` and abort the test session — partial undo would
+silently contaminate later tests.
+
 ### Capturing MIDI_OUT events (Phase 2)
 
 The shim publishes every MIDI_OUT packet it observes to a SHM ring;
