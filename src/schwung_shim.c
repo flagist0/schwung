@@ -2395,6 +2395,14 @@ static int shm_ext_midi_remap_fd = -1;
 static int shm_screenreader_fd = -1;
 static int shm_pub_audio_fd = -1;
 static int shm_overlay_fd = -1;
+static int shm_test_stream_midi_out_fd = -1;
+
+/* Phase 2 test-bus: MIDI_OUT capture stream. Gated by enabled flag —
+ * cost when no test client is attached is one atomic load + branch
+ * per SPI frame in shim_publish_midi_out_stream(). See
+ * shadow_constants.h for the contract and flagist0/schwung#2 for the
+ * full design. */
+static test_stream_shm_t *test_stream_midi_out_shm = NULL;
 
 /* Shadow initialization state */
 static int shadow_shm_initialized = 0;
@@ -2920,6 +2928,25 @@ static void init_shadow_shm(void)
         }
     } else {
         printf("Shadow: Failed to create overlay shm\n");
+    }
+
+    /* Test-bus MIDI_OUT stream (Phase 2). Created unconditionally so the
+     * shim's publisher branch is cheap when no test client is attached;
+     * `enabled` starts at 0 and gets set by schwung-testd on SUBSCRIBE. */
+    shm_test_stream_midi_out_fd = shm_open(SHM_TEST_STREAM_MIDI_OUT, O_CREAT | O_RDWR, 0666);
+    if (shm_test_stream_midi_out_fd >= 0) {
+        ftruncate(shm_test_stream_midi_out_fd, sizeof(test_stream_shm_t));
+        test_stream_midi_out_shm = (test_stream_shm_t *)mmap(NULL, sizeof(test_stream_shm_t),
+                                                              PROT_READ | PROT_WRITE,
+                                                              MAP_SHARED, shm_test_stream_midi_out_fd, 0);
+        if (test_stream_midi_out_shm == MAP_FAILED) {
+            test_stream_midi_out_shm = NULL;
+            printf("Shadow: Failed to mmap test-stream midi_out shm\n");
+        } else {
+            memset(test_stream_midi_out_shm, 0, sizeof(test_stream_shm_t));
+        }
+    } else {
+        printf("Shadow: Failed to create test-stream midi_out shm\n");
     }
 
     /* TTS engine uses lazy initialization - will init on first speak */
@@ -5335,6 +5362,42 @@ static void shim_block_cable2_in_sh_midi(uint8_t *sh_midi) {
  * so Move's DSP receives them as cable-0 and routes them to native instruments
  * by MIDI channel — the same path used when Schwung is not installed.
  * Called only when no tool module is active or a module is suspended. */
+/* Phase 2 test-bus: publish every MIDI_OUT packet observed this frame
+ * into /schwung-test-stream-midi-out so a subscribed schwung-testd can
+ * replay the sequence to a test runner.
+ *
+ * Gated on `enabled` so the fast path (no test client attached) is one
+ * atomic load + branch. When enabled, ~20 iterations of a tight loop
+ * × ~8 ns each ≈ 160 ns per frame — well within the SPI callback
+ * budget. SPSC ring: shim is the sole writer (this function), daemon
+ * is the sole reader. No CAS needed; RELEASE store on write_seq pairs
+ * with daemon's ACQUIRE load. */
+static void shim_publish_midi_out_stream(const uint8_t *hw_midi_out) {
+    test_stream_shm_t *shm = test_stream_midi_out_shm;
+    if (!shm) return;
+    if (!__atomic_load_n(&shm->enabled, __ATOMIC_RELAXED)) return;
+
+    const uint32_t frame = shadow_control ? shadow_control->shim_counter : 0;
+    uint32_t seq = __atomic_load_n(&shm->write_seq, __ATOMIC_RELAXED);
+
+    /* HW_MIDI_OUT_SIZE = 80 bytes = 20 packets of 4 bytes. Real events
+     * have a non-zero header (cable+CIN); slot 0x00 marks end-of-events. */
+    for (int i = 0; i < HW_MIDI_OUT_SIZE; i += 4) {
+        if (hw_midi_out[i] == 0) break;
+        test_stream_event_t *ev = &shm->buffer[seq % TEST_STREAM_CAPACITY];
+        ev->frame  = frame;
+        ev->pkt[0] = hw_midi_out[i];
+        ev->pkt[1] = hw_midi_out[i + 1];
+        ev->pkt[2] = hw_midi_out[i + 2];
+        ev->pkt[3] = hw_midi_out[i + 3];
+        seq++;
+    }
+
+    /* Single RELEASE store publishes all events written this frame.
+     * Daemon's ACQUIRE load sees these events as visible together. */
+    __atomic_store_n(&shm->write_seq, seq, __ATOMIC_RELEASE);
+}
+
 static void shim_forward_cable2_to_move(void) {
     if (!hardware_mmap_addr) return;
     uint8_t *hw_buf = hardware_mmap_addr + MIDI_IN_OFFSET;
@@ -5381,6 +5444,11 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
      * consistent). Must run before any post-transfer logic that reads
      * MIDI_IN. */
     shim_remap_cable2_channels(shadow);
+
+    /* Phase 2 test-bus: publish observed MIDI_OUT events to the test
+     * stream SHM if a test client is subscribed. No-op when disabled
+     * (one atomic load + branch). */
+    shim_publish_midi_out_stream(hw);
 
     /* XMOS SysEx logger — POST-transfer view of hw[MIDI_OUT] BEFORE the
      * hw→shadow memcpy below. Lets us see what XMOS left in the slots

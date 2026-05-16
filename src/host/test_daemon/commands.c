@@ -112,8 +112,97 @@ static int cmd_snapshot_pad_leds(int fd, const char *args) {
     return protocol_reply(fd, line);
 }
 
+/* ---- Phase 2: MIDI_OUT stream subscription ---------------------------- */
+
+/* Per-subscriber baseline: the write_seq value at the moment of
+ * SUBSCRIBE_MIDI_OUT (or the most recent DUMP_MIDI_OUT). Events after
+ * this point haven't been delivered yet. Single global because the
+ * daemon serves one client at a time. */
+static uint32_t g_midi_out_baseline = 0;
+static int      g_midi_out_subscribed = 0;
+
+static int cmd_subscribe_midi_out(int fd, const char *args) {
+    if (args && *args) return protocol_reply_err(fd, "SUBSCRIBE_MIDI_OUT takes no args");
+    test_stream_shm_t *s = g_shm.midi_out_stream;
+    if (!s) return protocol_reply_err(fd, "test-stream SHM not mapped");
+
+    /* Enable capture in the shim and snapshot the current write_seq so
+     * subsequent DUMP returns only events captured from this point on.
+     * If already subscribed, this acts as a reset. */
+    __atomic_store_n(&s->enabled, 1, __ATOMIC_RELEASE);
+    g_midi_out_baseline = __atomic_load_n(&s->write_seq, __ATOMIC_ACQUIRE);
+    g_midi_out_subscribed = 1;
+    return protocol_reply(fd, "OK");
+}
+
+static int cmd_unsubscribe_midi_out(int fd, const char *args) {
+    if (args && *args) return protocol_reply_err(fd, "UNSUBSCRIBE_MIDI_OUT takes no args");
+    test_stream_shm_t *s = g_shm.midi_out_stream;
+    if (s) __atomic_store_n(&s->enabled, 0, __ATOMIC_RELEASE);
+    g_midi_out_subscribed = 0;
+    return protocol_reply(fd, "OK");
+}
+
+/* DUMP_MIDI_OUT response format (multi-line):
+ *   OK count=<N> dropped=<D>
+ *   EV <frame_hex> <pkt_hex>     (×N lines)
+ *   END
+ * frame_hex is 8 hex chars (uint32). pkt_hex is 8 hex chars (4 USB-MIDI
+ * bytes). Lines kept short and parser-friendly. */
+static int cmd_dump_midi_out(int fd, const char *args) {
+    if (args && *args) return protocol_reply_err(fd, "DUMP_MIDI_OUT takes no args");
+    test_stream_shm_t *s = g_shm.midi_out_stream;
+    if (!s) return protocol_reply_err(fd, "test-stream SHM not mapped");
+    if (!g_midi_out_subscribed) {
+        return protocol_reply_err(fd, "not subscribed (call SUBSCRIBE_MIDI_OUT first)");
+    }
+
+    /* ACQUIRE pairs with shim's RELEASE on write_seq → buffer writes
+     * are visible to us. */
+    uint32_t cur = __atomic_load_n(&s->write_seq, __ATOMIC_ACQUIRE);
+    uint32_t delta = cur - g_midi_out_baseline;
+    uint32_t to_read = delta;
+    uint32_t dropped = 0;
+    uint32_t first = g_midi_out_baseline;
+
+    if (delta > TEST_STREAM_CAPACITY) {
+        /* Writer wrapped past us; oldest events were overwritten. */
+        dropped = delta - TEST_STREAM_CAPACITY;
+        to_read = TEST_STREAM_CAPACITY;
+        first = cur - TEST_STREAM_CAPACITY;
+    }
+
+    char hdr[TESTD_LINE_MAX];
+    snprintf(hdr, sizeof(hdr), "OK count=%u dropped=%u", to_read, dropped);
+    if (protocol_reply(fd, hdr) < 0) return -1;
+
+    /* Copy each event out (snapshot per-event so the buffer slot can be
+     * overwritten by the shim mid-dump without corrupting our read). */
+    for (uint32_t i = 0; i < to_read; i++) {
+        uint32_t seq = first + i;
+        test_stream_event_t ev = s->buffer[seq % TEST_STREAM_CAPACITY];
+        char pkt_hex[9];
+        protocol_format_hex(ev.pkt, 4, pkt_hex);
+        char line[TESTD_LINE_MAX];
+        snprintf(line, sizeof(line), "EV %08x %s", ev.frame, pkt_hex);
+        if (protocol_reply(fd, line) < 0) return -1;
+    }
+
+    if (protocol_reply(fd, "END") < 0) return -1;
+    g_midi_out_baseline = cur;
+    return 0;
+}
+
 static int cmd_quit(int fd, const char *args) {
     (void)args;
+    /* On disconnect, leave the shim's stream capture running (idempotent,
+     * cheap) — main() will exit the process anyway when the client
+     * disconnects? No — main keeps listening. Disable so the shim's
+     * write_seq doesn't drift while no one's draining. */
+    if (g_midi_out_subscribed && g_shm.midi_out_stream) {
+        __atomic_store_n(&g_shm.midi_out_stream->enabled, 0, __ATOMIC_RELEASE);
+        g_midi_out_subscribed = 0;
+    }
     protocol_reply(fd, "OK bye");
     return 1;  /* signal: close connection after this reply */
 }
@@ -128,11 +217,14 @@ typedef struct {
 } command_entry_t;
 
 static const command_entry_t g_commands[] = {
-    {"PING",              cmd_ping},
-    {"INJECT_MIDI",       cmd_inject_midi},
-    {"WAIT_FRAME",        cmd_wait_frame},
-    {"SNAPSHOT_PAD_LEDS", cmd_snapshot_pad_leds},
-    {"QUIT",              cmd_quit},
+    {"PING",                 cmd_ping},
+    {"INJECT_MIDI",          cmd_inject_midi},
+    {"WAIT_FRAME",           cmd_wait_frame},
+    {"SNAPSHOT_PAD_LEDS",    cmd_snapshot_pad_leds},
+    {"SUBSCRIBE_MIDI_OUT",   cmd_subscribe_midi_out},
+    {"UNSUBSCRIBE_MIDI_OUT", cmd_unsubscribe_midi_out},
+    {"DUMP_MIDI_OUT",        cmd_dump_midi_out},
+    {"QUIT",                 cmd_quit},
     {NULL, NULL},
 };
 

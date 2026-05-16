@@ -1,12 +1,14 @@
 """TCP client for schwung-testd, the on-device test-bus daemon.
 
-Wraps the v1 line protocol (PING / INJECT_MIDI / WAIT_FRAME / SNAPSHOT_PAD_LEDS
-/ QUIT) and exposes both raw primitives and semantic helpers (press_pad,
-release_pad). The daemon listens on TCP loopback by default; reach it from a
-dev machine via `ssh -L 47777:localhost:47777`.
+Wraps the line protocol (PING / INJECT_MIDI / WAIT_FRAME /
+SNAPSHOT_PAD_LEDS / SUBSCRIBE_MIDI_OUT / DUMP_MIDI_OUT /
+UNSUBSCRIBE_MIDI_OUT / QUIT) and exposes both raw primitives and
+semantic helpers (press_pad, release_pad, capture_midi_out). The daemon
+listens on TCP loopback by default; reach it from a dev machine via
+`ssh -L 47777:localhost:47777`.
 
-Sequential, single-connection — matches the Phase 1 daemon, which accepts
-one client at a time. Threading and async are out of scope for v1.
+Sequential, single-connection — matches the Phase 1 daemon, which
+accepts one client at a time. Threading and async are out of scope.
 """
 
 from __future__ import annotations
@@ -14,8 +16,8 @@ from __future__ import annotations
 import os
 import socket
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 47777
@@ -28,6 +30,80 @@ class SchwungBusError(RuntimeError):
 @dataclass
 class WaitFrameResult:
     counter: int
+
+
+@dataclass
+class MidiOutEvent:
+    """One USB-MIDI packet observed in Move's MIDI_OUT by the shim."""
+    frame: int       # shim_counter at capture time
+    cable: int       # 0=internal, 2=external USB
+    cin: int         # USB-MIDI Code Index Number (0x9=note-on, 0x8=note-off, 0xB=CC...)
+    status: int      # MIDI status byte (0x90, 0x80, 0xB0, ...)
+    data1: int       # note / CC#
+    data2: int       # velocity / value
+
+    @property
+    def channel(self) -> int:
+        return self.status & 0x0F
+
+    @property
+    def kind(self) -> str:
+        """Human-readable event kind. Matches the `status=...` filter values."""
+        hi = self.status & 0xF0
+        return {
+            0x80: "note_off",
+            0x90: "note_on",
+            0xA0: "aftertouch",
+            0xB0: "cc",
+            0xC0: "program_change",
+            0xD0: "channel_pressure",
+            0xE0: "pitch_bend",
+            0xF0: "system",
+        }.get(hi, "unknown")
+
+
+@dataclass
+class MidiOutCapture:
+    """A snapshot of MIDI_OUT events drained from the daemon.
+
+    Returned by `bus.dump_midi_out()`. Supports simple filtering helpers
+    so tests read naturally:
+
+        cap = bus.dump_midi_out()
+        ons  = cap.filter(kind="note_on")
+        offs = cap.filter(kind="note_off", note=60)
+        assert len(offs) >= len(ons), "stuck notes"
+    """
+    events: List[MidiOutEvent] = field(default_factory=list)
+    dropped: int = 0  # events that overflowed the ring before we drained
+
+    def __len__(self) -> int:
+        return len(self.events)
+
+    def __iter__(self):
+        return iter(self.events)
+
+    def filter(
+        self,
+        kind: Optional[str] = None,
+        cable: Optional[int] = None,
+        channel: Optional[int] = None,
+        note: Optional[int] = None,
+        cc: Optional[int] = None,
+    ) -> "MidiOutCapture":
+        """Return a new capture with only events matching all given keys.
+
+        `note` filters data1 for note-on/off/aftertouch events.
+        `cc` filters data1 for control-change events.
+        """
+        def keep(e: MidiOutEvent) -> bool:
+            if kind is not None and e.kind != kind: return False
+            if cable is not None and e.cable != cable: return False
+            if channel is not None and e.channel != channel: return False
+            if note is not None and e.data1 != note: return False
+            if cc is not None and e.data1 != cc: return False
+            return True
+        return MidiOutCapture(events=[e for e in self.events if keep(e)], dropped=0)
 
 
 class SchwungBus:
@@ -127,6 +203,81 @@ class SchwungBus:
             raise SchwungBusError(f"expected 32 LED bytes, got {len(data)}")
         return data
 
+    # ----- MIDI_OUT stream subscription (Phase 2) ---------------------------
+
+    def subscribe_midi_out(self) -> None:
+        """Start capturing MIDI_OUT events. Resets the per-subscriber
+        baseline so the next `dump_midi_out()` returns events from now.
+
+        The shim's capture path stays on until `unsubscribe_midi_out()`
+        (or QUIT / connection close) — the cost when idle is one atomic
+        load + branch per SPI frame, negligible.
+        """
+        self._request("SUBSCRIBE_MIDI_OUT")
+
+    def unsubscribe_midi_out(self) -> None:
+        """Stop capturing MIDI_OUT events in the shim."""
+        self._request("UNSUBSCRIBE_MIDI_OUT")
+
+    def dump_midi_out(self) -> MidiOutCapture:
+        """Drain MIDI_OUT events captured since the last subscribe/dump.
+
+        Advances the baseline so the next call returns only new events.
+        `dropped` is non-zero if the ring overflowed (1024 events fit) —
+        bump TEST_STREAM_CAPACITY in shadow_constants.h if you hit it.
+        """
+        if self._sock is None:
+            raise SchwungBusError("bus not connected")
+        self._send_line("DUMP_MIDI_OUT")
+        header = self._read_line()
+        if not (header == "OK" or header.startswith("OK ")):
+            if header.startswith("ERR"):
+                raise SchwungBusError(header[3:].lstrip() or "ERR (no message)")
+            raise SchwungBusError(f"unexpected DUMP_MIDI_OUT reply: {header!r}")
+        # Parse "OK count=N dropped=D"
+        rest = header[2:].lstrip()
+        count = 0
+        dropped = 0
+        for tok in rest.split():
+            if tok.startswith("count="):
+                count = int(tok[6:])
+            elif tok.startswith("dropped="):
+                dropped = int(tok[8:])
+        events: List[MidiOutEvent] = []
+        for _ in range(count):
+            line = self._read_line()
+            if not line.startswith("EV "):
+                raise SchwungBusError(f"expected EV line, got {line!r}")
+            _, frame_hex, pkt_hex = line.split()
+            frame = int(frame_hex, 16)
+            pkt = bytes.fromhex(pkt_hex)
+            if len(pkt) != 4:
+                raise SchwungBusError(f"EV packet must be 4 bytes, got {len(pkt)}")
+            events.append(MidiOutEvent(
+                frame=frame,
+                cable=(pkt[0] >> 4) & 0x0F,
+                cin=pkt[0] & 0x0F,
+                status=pkt[1],
+                data1=pkt[2],
+                data2=pkt[3],
+            ))
+        end = self._read_line()
+        if end != "END":
+            raise SchwungBusError(f"expected END, got {end!r}")
+        return MidiOutCapture(events=events, dropped=dropped)
+
+    def capture_midi_out(self) -> "MidiOutCaptureContext":
+        """Context manager: subscribe on enter, dump on exit.
+
+        Usage::
+
+            with bus.capture_midi_out() as cap:
+                bus.press_pad(84)
+                bus.wait_frame(8)
+            # cap.events populated, subscription closed
+        """
+        return MidiOutCaptureContext(self)
+
     # ----- semantic helpers --------------------------------------------------
 
     def press_pad(self, note: int, velocity: int = 100) -> None:
@@ -201,3 +352,30 @@ class SchwungBus:
 def _check_pad_note(note: int) -> None:
     if not 68 <= note <= 99:
         raise ValueError(f"pad note must be 68..99, got {note}")
+
+
+class MidiOutCaptureContext:
+    """Context manager returned by SchwungBus.capture_midi_out().
+
+    On enter: calls subscribe_midi_out().
+    On exit:  calls dump_midi_out() (so the result is available via .events
+              after the `with` block) and unsubscribe_midi_out().
+
+    The captured events are exposed as `.events` (a MidiOutCapture).
+    """
+    def __init__(self, bus: "SchwungBus") -> None:
+        self._bus = bus
+        self.events: MidiOutCapture = MidiOutCapture()
+
+    def __enter__(self) -> "MidiOutCaptureContext":
+        self._bus.subscribe_midi_out()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            self.events = self._bus.dump_midi_out()
+        finally:
+            try:
+                self._bus.unsubscribe_midi_out()
+            except Exception:
+                pass

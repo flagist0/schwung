@@ -97,6 +97,10 @@ static int wire_shm(daemon_shm_t *out) {
                    (void **)&out->inject) < 0) return -1;
     if (map_shm_ro(SHM_SHADOW_OVERLAY, sizeof(shadow_overlay_state_t),
                    (void **)&out->overlay) < 0) return -1;
+    /* Test-stream is RW: daemon writes `enabled` to gate shim's capture,
+     * shim writes the buffer. */
+    if (map_shm_rw(SHM_TEST_STREAM_MIDI_OUT, sizeof(test_stream_shm_t),
+                   (void **)&out->midi_out_stream) < 0) return -1;
     return 0;
 }
 

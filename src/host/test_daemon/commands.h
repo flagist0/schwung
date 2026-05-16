@@ -20,9 +20,10 @@
 /* SHM pointers the daemon needs. main() sets these via commands_init()
  * before any client is served. */
 typedef struct daemon_shm {
-    shadow_control_t        *control;   /* RO: shim_counter for frame ack */
-    shadow_midi_inject_t    *inject;    /* RW: producers' inject ring */
-    shadow_overlay_state_t  *overlay;   /* RO: pad_led_colors snapshot */
+    shadow_control_t        *control;       /* RO: shim_counter for frame ack */
+    shadow_midi_inject_t    *inject;        /* RW: producers' inject ring */
+    shadow_overlay_state_t  *overlay;       /* RO: pad_led_colors snapshot */
+    test_stream_shm_t       *midi_out_stream; /* RW: stream of MIDI_OUT events from shim */
 } daemon_shm_t;
 
 /* Wire SHM pointers into the command layer. Must be called before

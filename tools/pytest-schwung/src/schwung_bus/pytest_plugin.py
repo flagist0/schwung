@@ -1,10 +1,14 @@
 """Pytest entry point for pytest-schwung.
 
-Provides one fixture for the v1 skeleton: ``bus``, a session-scoped
-``SchwungBus`` connected to the daemon (default 127.0.0.1:47777, override
-with SCHWUNG_TEST_HOST / SCHWUNG_TEST_PORT). The bus auto-skips the
-collected tests if the daemon is unreachable, so smoke tests degrade
-gracefully on machines without a Move attached.
+Fixtures:
+  ``bus``               session-scoped SchwungBus, connected and
+                        ping-validated. Auto-skips collected tests if
+                        the daemon is unreachable.
+  ``midi_out_capture``  function-scoped capture of MIDI_OUT events that
+                        happened during the test body. Yields a
+                        MidiOutCaptureContext whose `.events` is populated
+                        after the test runs — but tests can also use the
+                        context's bus methods directly for finer control.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import socket
 
 import pytest
 
-from .client import SchwungBus, SchwungBusError
+from .client import SchwungBus, SchwungBusError, MidiOutCaptureContext
 
 
 @pytest.fixture(scope="session")
@@ -29,3 +33,36 @@ def bus() -> SchwungBus:
         )
     yield b
     b.close()
+
+
+@pytest.fixture
+def midi_out_capture(bus) -> MidiOutCaptureContext:
+    """Capture MIDI_OUT events emitted during the test.
+
+    Tests treat this as a live handle to the capture: events are not yet
+    populated when the fixture is entered; they're populated when the
+    test calls `cap.events = bus.dump_midi_out()` explicitly, OR when
+    the fixture's teardown drains automatically.
+
+    Typical use::
+
+        def test_no_stuck_notes(bus, midi_out_capture):
+            bus.press_pad(84); bus.wait_frame(8)
+            bus.release_pad(84); bus.wait_frame(8)
+            cap = bus.dump_midi_out()  # snapshot before exit
+            assert len(cap.filter(kind="note_off")) >= len(cap.filter(kind="note_on"))
+    """
+    bus.subscribe_midi_out()
+    ctx = MidiOutCaptureContext(bus)
+    ctx._bus = bus  # already subscribed; suppress re-subscribe on enter
+    try:
+        yield ctx
+    finally:
+        try:
+            ctx.events = bus.dump_midi_out()
+        except Exception:
+            pass
+        try:
+            bus.unsubscribe_midi_out()
+        except Exception:
+            pass

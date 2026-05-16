@@ -108,6 +108,30 @@ with SchwungBus() as bus:
           [i for i in range(32) if before[i] != after[i]])
 ```
 
+### Capturing MIDI_OUT events (Phase 2)
+
+The shim publishes every MIDI_OUT packet it observes to a SHM ring;
+the daemon's `SUBSCRIBE_MIDI_OUT` / `DUMP_MIDI_OUT` / `UNSUBSCRIBE_MIDI_OUT`
+expose it to tests. The Python client wraps it with a context manager
+and a typed event class:
+
+```py
+with bus.capture_midi_out() as cap:
+    bus.press_pad(84, velocity=100)
+    bus.wait_frame(8)
+    bus.release_pad(84)
+    bus.wait_frame(20)
+
+# After the with block, cap.events is a MidiOutCapture
+note_ons  = cap.events.filter(kind="note_on", note=84).events
+note_offs = cap.events.filter(kind="note_off", note=84).events
+assert len(note_offs) >= len(note_ons), "stuck note!"
+```
+
+The pytest fixture `midi_out_capture` does the same wiring around a
+test body — the fixture's teardown drains and unsubscribes even if the
+test fails, so the next test starts with a clean baseline.
+
 ## Protocol v1
 
 Line-based, ASCII, `\n`-terminated. One command per line, one response per
@@ -119,6 +143,9 @@ line. Replies start with `OK` or `ERR`.
 | `INJECT_MIDI 0BB0307F` | `OK` |
 | `WAIT_FRAME 5` | `OK frame=1234567` |
 | `SNAPSHOT_PAD_LEDS` | `OK 00000000010000…` (64 hex chars = 32 bytes) |
+| `SUBSCRIBE_MIDI_OUT` | `OK` (enables shim capture, sets baseline) |
+| `DUMP_MIDI_OUT` | multi-line: `OK count=<N> dropped=<D>` then `EV <frame_hex> <pkt_hex>` × N, then `END` |
+| `UNSUBSCRIBE_MIDI_OUT` | `OK` (disables shim capture) |
 | `QUIT` | `OK bye` (server then closes the connection) |
 
 `INJECT_MIDI` takes one 4-byte USB-MIDI packet as 8 hex chars. Pad presses
@@ -133,14 +160,14 @@ ceiling guard against runaway tests.
 one per pad. Index 0 = note 68 (track 4 pad A), index 31 = note 99
 (track 1 pad H).
 
-## What this skeleton does NOT do yet
+## What this does NOT do yet
 
 (All planned in later phases — see issue #2.)
 
-* Streams (MIDI in/out, log, audio) with category masks
+* Streams for `midi_in`, `log`, `audio` (only `midi_out` so far)
 * Display framebuffer snapshots + syrupy diffing
 * Module state providers (`host_register_test_state`)
 * `device_files` fixture for SSH-backed file ops
 * Combinator helpers (`bus.wait_all`)
-* Sub-filters on streams (`midi_out:cable=0,status=note_off`)
+* Server-side sub-filters on subscriptions (`midi_out:cable=0,status=note_off`) — for now, filter client-side via `cap.filter(...)`
 * Audio fixture WAV-as-line-in injection
