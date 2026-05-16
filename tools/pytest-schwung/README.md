@@ -143,9 +143,9 @@ line. Replies start with `OK` or `ERR`.
 | `INJECT_MIDI 0BB0307F` | `OK` |
 | `WAIT_FRAME 5` | `OK frame=1234567` |
 | `SNAPSHOT_PAD_LEDS` | `OK 00000000010000…` (64 hex chars = 32 bytes) |
-| `SUBSCRIBE_MIDI_OUT` | `OK` (enables shim capture, sets baseline) |
-| `DUMP_MIDI_OUT` | multi-line: `OK count=<N> dropped=<D>` then `EV <frame_hex> <pkt_hex>` × N, then `END` |
-| `UNSUBSCRIBE_MIDI_OUT` | `OK` (disables shim capture) |
+| `SUBSCRIBE <channel>` | `OK` (enables shim capture, sets baseline). v1 channels: `midi_out`. |
+| `DUMP <channel>` | multi-line: `OK count=<N> dropped=<D>` then `EV <frame_hex> <pkt_hex>` × N, then `END` |
+| `UNSUBSCRIBE <channel>` | `OK` (disables shim capture for that channel) |
 | `QUIT` | `OK bye` (server then closes the connection) |
 
 `INJECT_MIDI` takes one 4-byte USB-MIDI packet as 8 hex chars. Pad presses

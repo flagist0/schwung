@@ -1,7 +1,7 @@
 """TCP client for schwung-testd, the on-device test-bus daemon.
 
 Wraps the line protocol (PING / INJECT_MIDI / WAIT_FRAME /
-SNAPSHOT_PAD_LEDS / SUBSCRIBE_MIDI_OUT / DUMP_MIDI_OUT /
+SNAPSHOT_PAD_LEDS / SUBSCRIBE_MIDI_OUT / DUMP midi_out /
 UNSUBSCRIBE_MIDI_OUT / QUIT) and exposes both raw primitives and
 semantic helpers (press_pad, release_pad, capture_midi_out). The daemon
 listens on TCP loopback by default; reach it from a dev machine via
@@ -203,41 +203,56 @@ class SchwungBus:
             raise SchwungBusError(f"expected 32 LED bytes, got {len(data)}")
         return data
 
-    # ----- MIDI_OUT stream subscription (Phase 2) ---------------------------
+    # ----- stream subscriptions (Phase 2) -----------------------------------
+
+    def subscribe(self, channel: str) -> None:
+        """Start capturing events on the given test-bus channel.
+
+        Channels currently supported: ``midi_out``. Phase 3 will add
+        ``midi_in`` and a log-tail channel. Resets the per-subscriber
+        baseline so the next ``dump(channel)`` returns events from now.
+        """
+        self._request(f"SUBSCRIBE {channel}")
+
+    def unsubscribe(self, channel: str) -> None:
+        """Stop capturing events on the given channel."""
+        self._request(f"UNSUBSCRIBE {channel}")
+
+    def dump(self, channel: str) -> MidiOutCapture:
+        """Drain events for ``channel`` since the last subscribe/dump.
+
+        Currently only ``midi_out`` is wired through MidiOutEvent
+        parsing; future channels will return their own event type.
+        Use the convenience wrapper ``dump_midi_out()`` for clarity.
+        """
+        if channel != "midi_out":
+            raise SchwungBusError(
+                f"dump({channel!r}) — only 'midi_out' is implemented in Phase 2; "
+                "Phase 3+ will add more channels."
+            )
+        return self._dump_midi_out_impl()
 
     def subscribe_midi_out(self) -> None:
-        """Start capturing MIDI_OUT events. Resets the per-subscriber
-        baseline so the next `dump_midi_out()` returns events from now.
-
-        The shim's capture path stays on until `unsubscribe_midi_out()`
-        (or QUIT / connection close) — the cost when idle is one atomic
-        load + branch per SPI frame, negligible.
-        """
-        self._request("SUBSCRIBE_MIDI_OUT")
+        """Convenience: ``subscribe('midi_out')``."""
+        self.subscribe("midi_out")
 
     def unsubscribe_midi_out(self) -> None:
-        """Stop capturing MIDI_OUT events in the shim."""
-        self._request("UNSUBSCRIBE_MIDI_OUT")
+        """Convenience: ``unsubscribe('midi_out')``."""
+        self.unsubscribe("midi_out")
 
     def dump_midi_out(self) -> MidiOutCapture:
-        """Drain MIDI_OUT events captured since the last subscribe/dump.
+        """Convenience: ``dump('midi_out')``."""
+        return self._dump_midi_out_impl()
 
-        Advances the baseline so the next call returns only new events.
-        `dropped` is non-zero if the ring overflowed (1024 events fit) —
-        bump TEST_STREAM_CAPACITY in shadow_constants.h if you hit it.
-
-        Wraps every parser failure in SchwungBusError (not raw ValueError)
-        so callers get a consistent exception type and a message that
-        names what went wrong on the wire.
-        """
+    def _dump_midi_out_impl(self) -> MidiOutCapture:
         if self._sock is None:
             raise SchwungBusError("bus not connected")
-        self._send_line("DUMP_MIDI_OUT")
+        self._send_line("DUMP midi_out")
         header = self._read_line()
         if not (header == "OK" or header.startswith("OK ")):
             if header.startswith("ERR"):
                 raise SchwungBusError(header[3:].lstrip() or "ERR (no message)")
-            raise SchwungBusError(f"unexpected DUMP_MIDI_OUT reply: {header!r}")
+            raise SchwungBusError(f"unexpected DUMP reply: {header!r}")
 
         # Parse "OK count=N dropped=D" — count is required.
         rest = header[2:].lstrip()
@@ -248,16 +263,16 @@ class SchwungBus:
                 try:
                     count = int(tok[6:])
                 except ValueError as e:
-                    raise SchwungBusError(f"DUMP_MIDI_OUT bad count token: {tok!r}") from e
+                    raise SchwungBusError(f"DUMP midi_out bad count token: {tok!r}") from e
             elif tok.startswith("dropped="):
                 try:
                     dropped = int(tok[8:])
                 except ValueError as e:
-                    raise SchwungBusError(f"DUMP_MIDI_OUT bad dropped token: {tok!r}") from e
+                    raise SchwungBusError(f"DUMP midi_out bad dropped token: {tok!r}") from e
         if count is None:
-            raise SchwungBusError(f"DUMP_MIDI_OUT header missing count=: {header!r}")
+            raise SchwungBusError(f"DUMP midi_out header missing count=: {header!r}")
         if count < 0 or dropped < 0:
-            raise SchwungBusError(f"DUMP_MIDI_OUT negative count/dropped: {header!r}")
+            raise SchwungBusError(f"DUMP midi_out negative count/dropped: {header!r}")
 
         events: List[MidiOutEvent] = []
         for _ in range(count):

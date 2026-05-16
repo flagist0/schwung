@@ -2,9 +2,11 @@
  * commands.c — verb table + handlers for schwung-testd.
  *
  * One verb-table row per supported command; handlers operate on the
- * SHM pointers wired in via commands_init(). Adding a Phase 2 command
- * (e.g. SUBSCRIBE, DUMP) means adding a handler here and listing it in
- * the table — no other file changes.
+ * SHM pointers wired in via commands_init(). Stream commands
+ * (SUBSCRIBE / DUMP / UNSUBSCRIBE) are channel-parametric: the verb
+ * takes a channel name and dispatches via the g_streams[] registry,
+ * so adding a new stream (MIDI_IN, log tail, etc.) means adding one
+ * row to g_streams + wiring the SHM in commands_init.
  */
 
 #define _GNU_SOURCE
@@ -31,22 +33,66 @@
 /* SHM pointers, set by commands_init() and held until process exit. */
 static daemon_shm_t g_shm;
 
-void commands_init(const daemon_shm_t *shm) {
-    g_shm = *shm;
+/* --------------------------------------------------------------------------
+ * Stream registry — one entry per test-bus channel.
+ *
+ * Adding a new stream (e.g. MIDI_IN in Phase 3):
+ *   1. Add the SHM pointer to daemon_shm_t in commands.h
+ *   2. Map it in schwung_testd.c:wire_shm()
+ *   3. Add a row to g_streams[] below
+ *   4. Wire it in commands_init() (one strcmp + assignment)
+ * No new commands needed; SUBSCRIBE/DUMP/UNSUBSCRIBE handle any
+ * channel by name.
+ * -------------------------------------------------------------------------- */
+
+typedef struct stream_state {
+    const char         *name;        /* protocol channel name (lowercase) */
+    test_stream_shm_t  *shm;         /* wired in commands_init from g_shm */
+    uint32_t            baseline;    /* per-client write_seq baseline */
+    int                 subscribed;  /* 1 if SUBSCRIBE outstanding */
+} stream_state_t;
+
+static stream_state_t g_streams[] = {
+    {"midi_out", NULL, 0, 0},
+};
+static const size_t N_STREAMS = sizeof(g_streams) / sizeof(g_streams[0]);
+
+static stream_state_t *find_stream(const char *name) {
+    if (!name) return NULL;
+    for (size_t i = 0; i < N_STREAMS; i++) {
+        if (strcmp(g_streams[i].name, name) == 0) return &g_streams[i];
+    }
+    return NULL;
 }
 
-/* Forward decls so commands_reset_client_state can clear stream state
- * before the per-stream globals are defined below. */
-static void midi_out_subscription_reset(void);
+static void stream_disable_and_reset(stream_state_t *s) {
+    if (s->shm) {
+        __atomic_store_n(&s->shm->enabled, 0, __ATOMIC_RELEASE);
+    }
+    s->subscribed = 0;
+    s->baseline = 0;
+}
+
+void commands_init(const daemon_shm_t *shm) {
+    g_shm = *shm;
+    /* Wire each registered stream to its SHM pointer. Phase 3 adds
+     * more channels here. */
+    for (size_t i = 0; i < N_STREAMS; i++) {
+        if (strcmp(g_streams[i].name, "midi_out") == 0) {
+            g_streams[i].shm = g_shm.midi_out_stream;
+        }
+    }
+}
 
 void commands_reset_client_state(void) {
     /* Called from schwung_testd.c after a client disconnects. Disables
-     * any subscriptions the prior client opened so the next client
-     * starts from a clean slate — without this, a dropped TCP
-     * connection (network blip, killed test runner, exception that
-     * bypassed QUIT) leaves the shim publishing into a ring we'd then
-     * misinterpret as "events captured for the new client." */
-    midi_out_subscription_reset();
+     * every stream the prior client opened so the next client starts
+     * from a clean slate — without this, a dropped TCP connection
+     * leaves the shim publishing into a ring we'd misinterpret as
+     * events for the new client. */
+    for (size_t i = 0; i < N_STREAMS; i++) {
+        stream_disable_and_reset(&g_streams[i]);
+    }
 }
 
 /* ---- handlers ---------------------------------------------------------- */
@@ -82,9 +128,6 @@ static int cmd_wait_frame(int fd, const char *args) {
     if (!args) return protocol_reply_err(fd, "WAIT_FRAME expects N");
     char *end = NULL;
     long n = strtol(args, &end, 10);
-    /* Require args to consume the entire token: `WAIT_FRAME 5junk` and
-     * `WAIT_FRAME 0x10` (strtol stops at 'x') would otherwise be silently
-     * accepted as 5 / 0. */
     if (end == args || *end != '\0' || n < 1 || n > TESTD_WAIT_FRAME_MAX) {
         return protocol_reply_err(fd, "WAIT_FRAME: N must be 1..10000");
     }
@@ -96,7 +139,6 @@ static int cmd_wait_frame(int fd, const char *args) {
     const long long timeout_ms = (long long)TESTD_WAIT_TIMEOUT_SEC * 1000LL;
     for (;;) {
         uint32_t cur = g_shm.control->shim_counter;
-        /* Signed delta handles uint32 wrap correctly. */
         if ((int32_t)(cur - target) >= 0) {
             char line[TESTD_LINE_MAX];
             snprintf(line, sizeof(line), "OK frame=%u", cur);
@@ -115,7 +157,6 @@ static int cmd_wait_frame(int fd, const char *args) {
 static int cmd_snapshot_pad_leds(int fd, const char *args) {
     if (args && *args) return protocol_reply_err(fd, "SNAPSHOT_PAD_LEDS takes no args");
     uint8_t copy[32];
-    /* Volatile copy: shim writes asynchronously on the SPI thread. */
     for (int i = 0; i < 32; i++) {
         copy[i] = g_shm.overlay->pad_led_colors[i];
     }
@@ -126,84 +167,59 @@ static int cmd_snapshot_pad_leds(int fd, const char *args) {
     return protocol_reply(fd, line);
 }
 
-/* ---- Phase 2: MIDI_OUT stream subscription ---------------------------- */
+/* ---- channel-parametric stream commands ------------------------------- */
 
-/* Per-subscriber baseline: the write_seq value at the moment of
- * SUBSCRIBE_MIDI_OUT (or the most recent DUMP_MIDI_OUT). Events after
- * this point haven't been delivered yet. Single global because the
- * daemon serves one client at a time; commands_reset_client_state()
- * clears it on disconnect so the next client doesn't inherit stale
- * baselines. */
-static uint32_t g_midi_out_baseline = 0;
-static int      g_midi_out_subscribed = 0;
+static int cmd_subscribe(int fd, const char *args) {
+    stream_state_t *s = find_stream(args);
+    if (!s) return protocol_reply_err(fd, "SUBSCRIBE: unknown channel (try: midi_out)");
+    if (!s->shm) return protocol_reply_err(fd, "SUBSCRIBE: channel SHM not mapped");
 
-static void midi_out_subscription_reset(void) {
-    if (g_shm.midi_out_stream) {
-        __atomic_store_n(&g_shm.midi_out_stream->enabled, 0, __ATOMIC_RELEASE);
-    }
-    g_midi_out_subscribed = 0;
-    g_midi_out_baseline = 0;
-}
-
-static int cmd_subscribe_midi_out(int fd, const char *args) {
-    if (args && *args) return protocol_reply_err(fd, "SUBSCRIBE_MIDI_OUT takes no args");
-    test_stream_shm_t *s = g_shm.midi_out_stream;
-    if (!s) return protocol_reply_err(fd, "test-stream SHM not mapped");
-
-    /* Enable capture in the shim and snapshot the current write_seq so
-     * subsequent DUMP returns only events captured from this point on.
-     * If already subscribed, this acts as a reset. */
-    __atomic_store_n(&s->enabled, 1, __ATOMIC_RELEASE);
-    g_midi_out_baseline = __atomic_load_n(&s->write_seq, __ATOMIC_ACQUIRE);
-    g_midi_out_subscribed = 1;
+    /* Enable shim's capture path and snapshot the current write_seq so
+     * the next DUMP returns only events captured from this point on.
+     * Re-subscribe acts as a baseline reset. */
+    __atomic_store_n(&s->shm->enabled, 1, __ATOMIC_RELEASE);
+    s->baseline = __atomic_load_n(&s->shm->write_seq, __ATOMIC_ACQUIRE);
+    s->subscribed = 1;
     return protocol_reply(fd, "OK");
 }
 
-static int cmd_unsubscribe_midi_out(int fd, const char *args) {
-    if (args && *args) return protocol_reply_err(fd, "UNSUBSCRIBE_MIDI_OUT takes no args");
-    test_stream_shm_t *s = g_shm.midi_out_stream;
-    if (s) __atomic_store_n(&s->enabled, 0, __ATOMIC_RELEASE);
-    g_midi_out_subscribed = 0;
+static int cmd_unsubscribe(int fd, const char *args) {
+    stream_state_t *s = find_stream(args);
+    if (!s) return protocol_reply_err(fd, "UNSUBSCRIBE: unknown channel");
+    stream_disable_and_reset(s);
     return protocol_reply(fd, "OK");
 }
 
-/* DUMP_MIDI_OUT response format (multi-line):
+/* DUMP <channel> — multi-line response:
  *   OK count=<N> dropped=<D>
  *   EV <frame_hex> <pkt_hex>     (×N lines)
  *   END
- * frame_hex is 8 hex chars (uint32). pkt_hex is 8 hex chars (4 USB-MIDI
- * bytes). Lines kept short and parser-friendly. */
-static int cmd_dump_midi_out(int fd, const char *args) {
-    if (args && *args) return protocol_reply_err(fd, "DUMP_MIDI_OUT takes no args");
-    test_stream_shm_t *s = g_shm.midi_out_stream;
-    if (!s) return protocol_reply_err(fd, "test-stream SHM not mapped");
-    if (!g_midi_out_subscribed) {
-        return protocol_reply_err(fd, "not subscribed (call SUBSCRIBE_MIDI_OUT first)");
+ */
+static int cmd_dump(int fd, const char *args) {
+    stream_state_t *s = find_stream(args);
+    if (!s) return protocol_reply_err(fd, "DUMP: unknown channel");
+    if (!s->shm) return protocol_reply_err(fd, "DUMP: channel SHM not mapped");
+    if (!s->subscribed) {
+        return protocol_reply_err(fd, "DUMP: not subscribed (call SUBSCRIBE first)");
     }
 
-    /* ACQUIRE pairs with shim's RELEASE on write_seq → buffer writes
-     * are visible to us. */
-    uint32_t cur = __atomic_load_n(&s->write_seq, __ATOMIC_ACQUIRE);
+    uint32_t cur = __atomic_load_n(&s->shm->write_seq, __ATOMIC_ACQUIRE);
 
-    /* Detect shim restart / SHM reset: if cur is BEFORE our baseline
-     * (signed delta negative), the underlying write_seq was zeroed
-     * while we held an old value. Treat as a fresh start: re-baseline
-     * silently and return empty. Otherwise the unsigned subtraction
-     * below would wrap to ~4 billion and we'd report nonsense
-     * `dropped` plus 1024 garbage events from the buffer. */
-    if ((int32_t)(cur - g_midi_out_baseline) < 0) {
-        g_midi_out_baseline = cur;
+    /* Shim-restart detection: if cur is BEFORE our baseline, the
+     * underlying write_seq was zeroed while we held an old value.
+     * Re-baseline silently and return empty. */
+    if ((int32_t)(cur - s->baseline) < 0) {
+        s->baseline = cur;
         if (protocol_reply(fd, "OK count=0 dropped=0") < 0) return -1;
         return protocol_reply(fd, "END");
     }
 
-    uint32_t delta = cur - g_midi_out_baseline;
+    uint32_t delta = cur - s->baseline;
     uint32_t to_read = delta;
     uint32_t dropped = 0;
-    uint32_t first = g_midi_out_baseline;
+    uint32_t first = s->baseline;
 
     if (delta > TEST_STREAM_CAPACITY) {
-        /* Writer wrapped past us; oldest events were overwritten. */
         dropped = delta - TEST_STREAM_CAPACITY;
         to_read = TEST_STREAM_CAPACITY;
         first = cur - TEST_STREAM_CAPACITY;
@@ -213,11 +229,9 @@ static int cmd_dump_midi_out(int fd, const char *args) {
     snprintf(hdr, sizeof(hdr), "OK count=%u dropped=%u", to_read, dropped);
     if (protocol_reply(fd, hdr) < 0) return -1;
 
-    /* Copy each event out (snapshot per-event so the buffer slot can be
-     * overwritten by the shim mid-dump without corrupting our read). */
     for (uint32_t i = 0; i < to_read; i++) {
         uint32_t seq = first + i;
-        test_stream_event_t ev = s->buffer[seq % TEST_STREAM_CAPACITY];
+        test_stream_event_t ev = s->shm->buffer[seq % TEST_STREAM_CAPACITY];
         char pkt_hex[9];
         protocol_format_hex(ev.pkt, 4, pkt_hex);
         char line[TESTD_LINE_MAX];
@@ -226,15 +240,15 @@ static int cmd_dump_midi_out(int fd, const char *args) {
     }
 
     if (protocol_reply(fd, "END") < 0) return -1;
-    g_midi_out_baseline = cur;
+    s->baseline = cur;
     return 0;
 }
 
 static int cmd_quit(int fd, const char *args) {
     (void)args;
     /* Symmetric with the post-disconnect cleanup in schwung_testd.c —
-     * either path leaves the shim with no live subscription. */
-    midi_out_subscription_reset();
+     * either path leaves the shim with no live subscriptions. */
+    commands_reset_client_state();
     protocol_reply(fd, "OK bye");
     return 1;  /* signal: close connection after this reply */
 }
@@ -249,14 +263,14 @@ typedef struct {
 } command_entry_t;
 
 static const command_entry_t g_commands[] = {
-    {"PING",                 cmd_ping},
-    {"INJECT_MIDI",          cmd_inject_midi},
-    {"WAIT_FRAME",           cmd_wait_frame},
-    {"SNAPSHOT_PAD_LEDS",    cmd_snapshot_pad_leds},
-    {"SUBSCRIBE_MIDI_OUT",   cmd_subscribe_midi_out},
-    {"UNSUBSCRIBE_MIDI_OUT", cmd_unsubscribe_midi_out},
-    {"DUMP_MIDI_OUT",        cmd_dump_midi_out},
-    {"QUIT",                 cmd_quit},
+    {"PING",              cmd_ping},
+    {"INJECT_MIDI",       cmd_inject_midi},
+    {"WAIT_FRAME",        cmd_wait_frame},
+    {"SNAPSHOT_PAD_LEDS", cmd_snapshot_pad_leds},
+    {"SUBSCRIBE",         cmd_subscribe},
+    {"UNSUBSCRIBE",       cmd_unsubscribe},
+    {"DUMP",              cmd_dump},
+    {"QUIT",              cmd_quit},
     {NULL, NULL},
 };
 
