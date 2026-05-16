@@ -132,9 +132,23 @@ Each `Command` has:
 - `undo(bus, commander)` — reverse it.
 
 Preconditions consult `bus.state()` (a `BusState` snapshot of shim
-state — `move_ui_mode`, `overtake_mode`, etc.). When a test needs
-finer granularity than `state()` exposes, we extend the daemon's
-STATE command and the shim's tracking one field at a time.
+state — `move_ui_mode`, `overtake_mode`, `shift_held`, `selected_slot`,
+`ui_slot`, `shim_counter`, `transport_playing`). LED state is on
+`bus.snapshot_pad_leds()` (32 bytes, notes 68-99) and
+`bus.snapshot_step_leds()` (16 bytes, notes 16-31). When a test needs
+finer granularity, extend the daemon's STATE response one field at a
+time.
+
+Concrete commands available today (in `schwung_bus.move_commands`):
+
+- `EnterTrackMenu()` — tap jog; undo taps back
+- `TapButton(name)` — generic tap with re-tap undo
+- `SelectTrack(n, restore_to=1)` — tap CC 40..43 (reversed: CC43=Track1)
+- `ToggleStep(n)` — press step pad note 16..31; undo re-presses
+
+Preconditions and undo semantics are documented per-command. New
+commands are added by subclassing `Command` (see `move_commands.py`
+for templates).
 
 The `commander` fixture handles teardown. Failures during `undo_all()`
 raise `UndoError` and abort the test session — partial undo would
@@ -174,7 +188,9 @@ line. Replies start with `OK` or `ERR`.
 | `PING` | `OK schwung-testd 0.1.0` |
 | `INJECT_MIDI 0BB0307F` | `OK` |
 | `WAIT_FRAME 5` | `OK frame=1234567` |
-| `SNAPSHOT_PAD_LEDS` | `OK 00000000010000…` (64 hex chars = 32 bytes) |
+| `SNAPSHOT_PAD_LEDS` | `OK 00000000010000…` (64 hex chars = 32 bytes; notes 68-99) |
+| `SNAPSHOT_STEP_LEDS` | `OK 00000000…` (32 hex chars = 16 bytes; notes 16-31) |
+| `STATE` | `OK move_ui_mode=N overtake_mode=N shift_held=N selected_slot=N ui_slot=N shim_counter=N transport_playing=N` |
 | `SUBSCRIBE <channel>` | `OK` (enables shim capture, sets baseline). v1 channels: `midi_out`. |
 | `DUMP <channel>` | multi-line: `OK count=<N> dropped=<D>` then `EV <frame_hex> <pkt_hex>` × N, then `END` |
 | `UNSUBSCRIBE <channel>` | `OK` (disables shim capture for that channel) |

@@ -5085,11 +5085,19 @@ pre_done:
 
     TIME_SECTION_END(spi_jack_midi_out_sum, spi_jack_midi_out_max);
 
-    /* Copy pad LED colors (notes 68-99) to overlay SHM for shadow_ui to read */
+    /* Copy LED colors out of led_queue into overlay SHM:
+     *   - pad_led_colors[32]: notes 68-99 (track pad grid) — read by shadow_ui
+     *   - step_led_colors[16]: notes 16-31 (sequencer steps) — read by Phase 3
+     *     E2E tests for precondition / assertion checks
+     * Same led_queue source, same cheap-loop pattern. */
     if (shadow_overlay_shm) {
         for (int i = 0; i < 32; i++) {
             int color = led_queue_get_note_led_color(68 + i);
             shadow_overlay_shm->pad_led_colors[i] = (color >= 0) ? (uint8_t)color : 0;
+        }
+        for (int i = 0; i < 16; i++) {
+            int color = led_queue_get_note_led_color(16 + i);
+            shadow_overlay_shm->step_led_colors[i] = (color >= 0) ? (uint8_t)color : 0;
         }
     }
     TIME_SECTION_START();

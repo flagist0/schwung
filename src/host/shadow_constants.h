@@ -59,7 +59,7 @@
 #define SHADOW_MIDI_DSP_BUFFER_SIZE 512  /* MIDI to DSP buffer from shadow UI (128 packets) */
 #define SHADOW_MIDI_INJECT_BUFFER_SIZE 256    /* MIDI inject buffer (64 packets) */
 #define SHADOW_SCREENREADER_BUFFER_SIZE 8448  /* Screen reader message buffer */
-#define SHADOW_OVERLAY_BUFFER_SIZE 256        /* Overlay state buffer */
+#define SHADOW_OVERLAY_BUFFER_SIZE 272        /* Overlay state buffer (bumped from 256 for step_led_colors) */
 
 /* Web UI ring buffer sizes */
 #define WEB_PARAM_KEY_LEN     64
@@ -407,6 +407,12 @@ typedef struct shadow_overlay_state_t {
     /* Pad LED colors (notes 68-99, written by shim from Move's MIDI_OUT cache).
      * Index 0 = note 68 (track 4 pad A), index 31 = note 99 (track 1 pad H). */
     volatile uint8_t  pad_led_colors[32];  /* velocity/color for each pad */
+
+    /* Step LED colors (notes 16-31, written by shim from the same cache).
+     * Index 0 = note 16 (step 1), index 15 = note 31 (step 16). Used by
+     * Command-pattern UI tests' preconditions and assertions; consumers
+     * other than test infra are free to read this too. */
+    volatile uint8_t  step_led_colors[16];
 } shadow_overlay_state_t;
 
 /* ============================================================================

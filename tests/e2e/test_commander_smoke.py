@@ -72,6 +72,7 @@ def test_precondition_fires_when_in_overlay(bus, commander, monkeypatch):
         selected_slot=0,
         ui_slot=0,
         shim_counter=12345,
+        transport_playing=0,
     )
     monkeypatch.setattr(bus, "state", lambda: fake_state)
     with pytest.raises(PreconditionError, match="EnterTrackMenu requires Move-native"):

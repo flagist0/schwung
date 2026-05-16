@@ -167,23 +167,43 @@ static int cmd_snapshot_pad_leds(int fd, const char *args) {
     return protocol_reply(fd, line);
 }
 
-/* STATE — single-line snapshot of selected shadow_control_t fields used
- * as precondition checks by Command-pattern UI tests (Phase 3). Fields
- * are space-separated `key=value` tokens; extend as commands need more.
- * Read-only, no side effects. */
+static int cmd_snapshot_step_leds(int fd, const char *args) {
+    if (args && *args) return protocol_reply_err(fd, "SNAPSHOT_STEP_LEDS takes no args");
+    uint8_t copy[16];
+    for (int i = 0; i < 16; i++) {
+        copy[i] = g_shm.overlay->step_led_colors[i];
+    }
+    char hex[33];
+    protocol_format_hex(copy, 16, hex);
+    char line[TESTD_LINE_MAX];
+    snprintf(line, sizeof(line), "OK %s", hex);
+    return protocol_reply(fd, line);
+}
+
+/* STATE — single-line snapshot of selected shim fields used as
+ * precondition checks by Command-pattern UI tests (Phase 3). Fields
+ * are space-separated `key=value` tokens; extend as commands need
+ * more. Read-only, no side effects.
+ *
+ * Mixes fields from shadow_control_t and shadow_overlay_state_t —
+ * both SHMs are already mapped, so combining into one STATE response
+ * saves the client a round trip. */
 static int cmd_state(int fd, const char *args) {
     if (args && *args) return protocol_reply_err(fd, "STATE takes no args");
-    shadow_control_t *c = g_shm.control;
+    shadow_control_t       *c = g_shm.control;
+    shadow_overlay_state_t *o = g_shm.overlay;
     char line[TESTD_LINE_MAX];
     snprintf(line, sizeof(line),
              "OK move_ui_mode=%u overtake_mode=%u shift_held=%u "
-             "selected_slot=%u ui_slot=%u shim_counter=%u",
+             "selected_slot=%u ui_slot=%u shim_counter=%u "
+             "transport_playing=%u",
              (unsigned)c->move_ui_mode,
              (unsigned)c->overtake_mode,
              (unsigned)c->shift_held,
              (unsigned)c->selected_slot,
              (unsigned)c->ui_slot,
-             (unsigned)c->shim_counter);
+             (unsigned)c->shim_counter,
+             (unsigned)o->transport_playing);
     return protocol_reply(fd, line);
 }
 
@@ -287,6 +307,7 @@ static const command_entry_t g_commands[] = {
     {"INJECT_MIDI",       cmd_inject_midi},
     {"WAIT_FRAME",        cmd_wait_frame},
     {"SNAPSHOT_PAD_LEDS", cmd_snapshot_pad_leds},
+    {"SNAPSHOT_STEP_LEDS",cmd_snapshot_step_leds},
     {"STATE",             cmd_state},
     {"SUBSCRIBE",         cmd_subscribe},
     {"UNSUBSCRIBE",       cmd_unsubscribe},

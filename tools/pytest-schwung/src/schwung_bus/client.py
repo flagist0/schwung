@@ -51,6 +51,7 @@ class BusState:
     selected_slot: int     # 0..3 — schwung slot focus
     ui_slot: int           # 0..3 — schwung slot for knob routing
     shim_counter: int      # SPI tick counter at moment of probe
+    transport_playing: int # 0=stopped, 1=playing (from overlay, set by MIDI Start/Stop)
 
     # Enum mirrors for readability in tests.
     MOVE_UI_UNKNOWN      = 0
@@ -248,6 +249,22 @@ class SchwungBus:
             raise SchwungBusError(f"expected 32 LED bytes, got {len(data)}")
         return data
 
+    def snapshot_step_leds(self) -> bytes:
+        """Return the current 16-byte sequencer-step LED color snapshot.
+
+        Index 0 = note 16 (step 1), ..., index 15 = note 31 (step 16).
+        Each byte is a Move LED color code (0 = off). Populated by the
+        shim from the same led_queue source as pad LEDs.
+        """
+        line = self._request("SNAPSHOT_STEP_LEDS")
+        try:
+            data = bytes.fromhex(line)
+        except ValueError as e:
+            raise SchwungBusError(f"bad SNAPSHOT_STEP_LEDS hex: {line!r}") from e
+        if len(data) != 16:
+            raise SchwungBusError(f"expected 16 LED bytes, got {len(data)}")
+        return data
+
     # ----- stream subscriptions (Phase 2) -----------------------------------
 
     def subscribe(self, channel: str) -> None:
@@ -417,6 +434,7 @@ class SchwungBus:
                 selected_slot=fields["selected_slot"],
                 ui_slot=fields["ui_slot"],
                 shim_counter=fields["shim_counter"],
+                transport_playing=fields["transport_playing"],
             )
         except KeyError as e:
             raise SchwungBusError(f"STATE: missing field {e}") from e

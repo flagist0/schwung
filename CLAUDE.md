@@ -44,9 +44,11 @@ ssh ableton@move.local "tail -f /data/UserData/schwung/debug.log"
 
 See `docs/LOGGING.md` for the full unified logging guide. In JS use `console.log()` (auto-routed) or import from `shared/logger.mjs`. In C use `LOG_DEBUG("source", "msg")` etc. from `host/unified_log.h`.
 
-### On-device E2E test bus (Phase 1 skeleton)
+### On-device E2E test bus
 
-`schwung-testd` is an opt-in TCP daemon (`bin/schwung-testd` in the tarball) that lets pytest from a dev machine inject MIDI events into Move's MIDI_IN buffer and snapshot shim state — see [flagist0/schwung#2](https://github.com/flagist0/schwung/issues/2) for the full design. Talks to the live shim via existing SHM contracts (`/schwung-control`, `/schwung-midi-inject`, `/schwung-overlay`); no shim modifications. Not started by `shim-entrypoint.sh` — start manually over SSH:
+`schwung-testd` is an opt-in TCP daemon (`bin/schwung-testd` in the tarball) that lets pytest from a dev machine drive Move end-to-end: inject MIDI events into MIDI_IN, capture MIDI_OUT events emitted by Move, snapshot pad LED / shim state, sequence reversible UI flows. See [flagist0/schwung#2](https://github.com/flagist0/schwung/issues/2) for the full design.
+
+The shim's contract with the daemon is intentionally thin: existing SHM segments (`/schwung-control`, `/schwung-midi-inject`, `/schwung-overlay`) plus one publisher (`shadow_test_stream_publish_midi_out`) for the MIDI_OUT capture stream. Not started by `shim-entrypoint.sh` — start manually over SSH:
 
 ```bash
 ssh ableton@move.local /data/UserData/schwung/bin/schwung-testd
@@ -55,7 +57,32 @@ pip install -e tools/pytest-schwung
 pytest tests/e2e -v
 ```
 
-Phase 1 commands: `PING`, `INJECT_MIDI`, `WAIT_FRAME`, `SNAPSHOT_PAD_LEDS`, `QUIT`. Future phases add streams (MIDI/log/audio), display snapshots via syrupy, module state providers, and a `device_files` SSH-backed fixture. See `tools/pytest-schwung/README.md` for full usage.
+Protocol commands:
+- **`PING`** → `OK schwung-testd <ver>`
+- **`INJECT_MIDI <hex8>`** → push one USB-MIDI packet to the inject ring (lock-free MPSC; coexists with JS host + shim writers)
+- **`WAIT_FRAME <N>`** → block until shim's SPI counter advances by N
+- **`SNAPSHOT_PAD_LEDS`** → 32 bytes of pad LED color (notes 68-99)
+- **`STATE`** → snapshot of `shadow_control_t` fields (move_ui_mode / overtake_mode / shift_held / selected_slot / ui_slot / shim_counter), used as precondition source by Command-pattern UI tests
+- **`SUBSCRIBE <channel>`** / **`DUMP <channel>`** / **`UNSUBSCRIBE <channel>`** → streams (currently `midi_out`; add new channels by extending `g_streams[]` in `src/host/test_daemon/commands.c`)
+- **`QUIT`** → server closes the connection
+
+Python API exposes both the raw primitives (`bus.inject_midi`, `bus.snapshot_pad_leds`, `bus.subscribe/dump/unsubscribe`) and a Command-pattern layer for reversible UI flows:
+
+```python
+from schwung_bus.move_commands import EnterTrackMenu, TapButton
+
+def test_x(bus, commander, midi_out_capture):
+    commander.do(EnterTrackMenu())                   # tap jog, push on stack
+    bus.wait_frame(8)
+    assert ...
+    # On teardown: commander.undo_all() runs LIFO — taps back to close menu.
+```
+
+Each `Command` defines `precondition` (reads `bus.state()` to verify the system is in a valid state for the action), `execute`, and `undo`. The `commander` pytest fixture handles teardown. Failures during undo bail loud via `UndoError` — silent partial undo would contaminate later tests invisibly.
+
+See `tools/pytest-schwung/README.md` for full usage and `tools/pytest-schwung/src/schwung_bus/move_commands.py` for available commands.
+
+Out of scope (tracked in #2): syrupy display snapshots, module state providers (`host_register_test_state`), audio streams, `device_files` SSH fixture for project file backup/restore.
 
 ## Device Constraints
 
