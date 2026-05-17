@@ -84,6 +84,13 @@ See `tools/pytest-schwung/README.md` for full usage and `tools/pytest-schwung/sr
 
 Out of scope (tracked in #2): syrupy display snapshots, module state providers (`host_register_test_state`), audio streams, `device_files` SSH fixture for project file backup/restore.
 
+**Test reset strategy** (three tiers — pick the cheapest that fits):
+- **L1 in-test undo** — Commander pattern. Microsecond cost per action. Best for tight-loop tests, undo-correctness tests, composable jestures via `commander.do(EnterTrackMenu())` style. See `tools/pytest-schwung/src/schwung_bus/commander.py` + `move_commands.py`.
+- **L2 per-test pristine** — patch Settings.json `currentSongIndex` + trigger `restart-move.sh` via shim's `shadow_control_t.restart_move` flag. **~4 seconds end-to-end** (measured on Move v2.0.0). Daemon survives, shim re-uses SHM. Default for most tests once `pristine_set` fixture lands.
+- **L3 nuclear** — `POST /api/v1/update/reboot` (HTTP API with 30-day auth-token cookie). ~30-45 seconds. Session-scoped, rare; full OS state reset.
+
+Direct programmatic "switch to song X" is **not exposed** by Move firmware (verified via D-Bus + HTTP + SQLite investigation 2026-05-17 — see memory `project_move_firmware_internals.md`). Move is device-driven by design; L2 is the closest thing to a clean reset.
+
 ## Device Constraints
 
 **Never write to `/tmp` on the Move device.** The root filesystem (`/`) is tiny (~463MB) and nearly always 100% full. `/tmp` is on rootfs. Writing there **will** fill the disk and break things. Always use `/data/UserData/` which has ~49GB free.
