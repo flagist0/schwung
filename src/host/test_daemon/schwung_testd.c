@@ -91,7 +91,10 @@ static int map_shm_rw(const char *name, size_t size, void **out) {
 }
 
 static int wire_shm(daemon_shm_t *out) {
-    if (map_shm_ro(SHM_SHADOW_CONTROL, sizeof(shadow_control_t),
+    /* Control is mapped RW: STATE reads many fields, RESTART_MOVE writes
+     * the `restart_move` flag. The cost of widening the mapping is zero
+     * for fields the daemon never writes — kernel doesn't care. */
+    if (map_shm_rw(SHM_SHADOW_CONTROL, sizeof(shadow_control_t),
                    (void **)&out->control) < 0) return -1;
     if (map_shm_rw(SHM_SHADOW_MIDI_INJECT, sizeof(shadow_midi_inject_t),
                    (void **)&out->inject) < 0) return -1;

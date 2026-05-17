@@ -55,6 +55,32 @@ def commander(bus) -> Commander:
 
 
 @pytest.fixture
+def fresh_move(bus):
+    """Restart Move's firmware before this test (~3 s).
+
+    Triggers ``restart-move.sh`` via the shim's restart_move flag —
+    SIGTERMs+SIGKILLs the whole Move chain and relaunches fresh. Move
+    reloads the same set on startup (currentSongIndex unchanged); this
+    fixture resets transient state (active overtake, held modifiers,
+    edit-mode position, etc.) but NOT the song content.
+
+    Use this when:
+      - your test needs Move's UI in a known reset state
+      - you don't care which set is loaded (or you'll position via
+        Commander after)
+
+    For a fixture that ALSO swaps to a known empty template set, use
+    ``pristine_set`` (TBD — needs device_files SSH helper).
+
+    Skip ``fresh_move`` for fast in-set tests where Commander pattern
+    undo suffices (3 s reset × N tests adds up in CI).
+    """
+    bus.restart_move()
+    bus.wait_for_shim_ready(timeout=15)
+    yield
+
+
+@pytest.fixture
 def midi_out_capture(bus) -> MidiOutSession:
     """Subscribe to MIDI_OUT events for the duration of one test.
 

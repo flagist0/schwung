@@ -284,6 +284,27 @@ static int cmd_dump(int fd, const char *args) {
     return 0;
 }
 
+/* RESTART_MOVE — set `shadow_control_t.restart_move=1`. The shim sees
+ * the flag on its next SPI frame and invokes /data/UserData/schwung/
+ * restart-move.sh via system(), which SIGTERMs+SIGKILLs the whole
+ * Move chain (MoveLauncher, MoveOriginal, schwung, shadow_ui) and
+ * relaunches a fresh /opt/move/Move with shim LD_PRELOAD'd via the
+ * standard wrapper. Total recovery time ~4 seconds end-to-end.
+ *
+ * The daemon and the test_stream SHM segments persist across the
+ * restart (they're not children of MoveOriginal, kernel keeps the SHM
+ * mapped). The shim's SHM init is idempotent (shm_open without
+ * O_EXCL re-uses the existing segment), so shim_counter etc. continue
+ * across the restart.
+ *
+ * After OK reply, callers should poll via STATE / WAIT_FRAME to detect
+ * when the shim is ticking again — typically ~3-5 seconds. */
+static int cmd_restart_move(int fd, const char *args) {
+    if (args && *args) return protocol_reply_err(fd, "RESTART_MOVE takes no args");
+    __atomic_store_n(&g_shm.control->restart_move, 1, __ATOMIC_RELEASE);
+    return protocol_reply(fd, "OK");
+}
+
 static int cmd_quit(int fd, const char *args) {
     (void)args;
     /* Symmetric with the post-disconnect cleanup in schwung_testd.c —
@@ -309,6 +330,7 @@ static const command_entry_t g_commands[] = {
     {"SNAPSHOT_PAD_LEDS", cmd_snapshot_pad_leds},
     {"SNAPSHOT_STEP_LEDS",cmd_snapshot_step_leds},
     {"STATE",             cmd_state},
+    {"RESTART_MOVE",      cmd_restart_move},
     {"SUBSCRIBE",         cmd_subscribe},
     {"UNSUBSCRIBE",       cmd_unsubscribe},
     {"DUMP",              cmd_dump},

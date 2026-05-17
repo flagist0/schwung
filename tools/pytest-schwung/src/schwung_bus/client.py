@@ -17,7 +17,7 @@ import os
 import socket
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 47777
@@ -438,6 +438,85 @@ class SchwungBus:
             )
         except KeyError as e:
             raise SchwungBusError(f"STATE: missing field {e}") from e
+
+    # ----- restart-move (L2 fast reset) -------------------------------------
+
+    def restart_move(self) -> None:
+        """Trigger restart-move.sh via the shim's `restart_move` flag.
+
+        Returns as soon as the daemon has written the flag — the shim
+        picks it up on the next SPI frame and invokes the restart
+        script. The Move stack goes down then back up over ~4 seconds.
+        Pair with :meth:`wait_for_shim_ready` to block until recovery.
+
+        The daemon and its SHM segments survive the restart (kernel
+        keeps them mapped). The shim re-attaches to existing segments
+        on init, so frame counter continuity is preserved.
+        """
+        self._request("RESTART_MOVE")
+
+    def wait_for_shim_ready(
+        self,
+        timeout: float = 15.0,
+        freeze_confirm: float = 0.4,
+        poll_interval: float = 0.1,
+    ) -> int:
+        """Wait through a restart-move.sh cycle: counter ticking →
+        frozen (shim dead) → ticking again (shim alive).
+
+        Two-phase detection because just "counter advanced" returns too
+        early — restart-move.sh has a ~1s preamble (sleep 1 + kill) during
+        which the old shim is still ticking. The reliable signal is the
+        freeze-then-thaw transition.
+
+        Phase 1: detect freeze. Counter must hold a single value for at
+        least ``freeze_confirm`` seconds (default 0.4s, ≈140 SPI frames
+        of stillness — clearly not normal jitter).
+
+        Phase 2: detect thaw. Counter advances past the frozen value.
+
+        Returns the counter at thaw. Raises SchwungBusError if either
+        phase doesn't complete within ``timeout``.
+        """
+        deadline = time.monotonic() + timeout
+
+        # Phase 1: freeze detection.
+        prev: Optional[int] = None
+        prev_at: float = time.monotonic()
+        frozen_at_value: Optional[int] = None
+        while time.monotonic() < deadline:
+            try:
+                cur = self.state().shim_counter
+                now = time.monotonic()
+                if prev is None or cur != prev:
+                    prev = cur
+                    prev_at = now
+                elif now - prev_at >= freeze_confirm:
+                    frozen_at_value = cur
+                    break
+            except SchwungBusError:
+                # Brief blip during restart is fine — keep polling.
+                pass
+            time.sleep(poll_interval)
+        if frozen_at_value is None:
+            raise SchwungBusError(
+                f"wait_for_shim_ready: counter never froze within {timeout}s "
+                f"(restart-move.sh may not have fired; last counter={prev})"
+            )
+
+        # Phase 2: thaw detection.
+        while time.monotonic() < deadline:
+            try:
+                cur = self.state().shim_counter
+                if cur > frozen_at_value:
+                    return cur
+            except SchwungBusError:
+                pass
+            time.sleep(poll_interval)
+        raise SchwungBusError(
+            f"wait_for_shim_ready: shim never recovered after freeze at "
+            f"counter={frozen_at_value} within {timeout}s"
+        )
 
     # ----- button helpers ---------------------------------------------------
 
