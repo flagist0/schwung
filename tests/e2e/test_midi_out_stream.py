@@ -124,7 +124,17 @@ def test_no_stuck_notes_after_pad_press_release(bus, midi_out_capture):
 def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
     """Pressing a pad on one track, then switching to another track,
     should not leave a stuck note on the original track. This is the
-    specific symptom the user keeps hitting in ion development."""
+    specific symptom the user keeps hitting in ion development.
+
+    Filters to ``cable=2`` (external USB MIDI out) — cable 0 carries LED
+    writes that use the same note-on wire format and would otherwise
+    flood the assertion with false positives (every track switch repaints
+    ~32 pad LEDs as note_on events). Real "stuck note" symptoms manifest
+    on the external bus where downstream synths actually keep ringing.
+
+    Requires at least one Move track armed to USB MIDI OUT. Skips
+    cleanly otherwise — that's a setup gap, not a regression.
+    """
     pad_t1 = 92  # track 1 pad A
     pad_t4 = 68  # track 4 pad A
 
@@ -147,9 +157,12 @@ def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
     bus.release_pad(pad_t4)
     bus.wait_frame(20)
 
-    cap = midi_out_capture.drain()
+    cap = midi_out_capture.drain().filter(cable=2)
     if len(cap) == 0:
-        pytest.skip("No MIDI_OUT — no armed tracks?")
+        pytest.skip(
+            "No cable=2 MIDI_OUT — no Move tracks armed to USB MIDI OUT. "
+            "Arm at least one track to USB on the Move to exercise this regression."
+        )
 
     for n in (pad_t1, pad_t4):
         ons  = [e for e in cap.filter(kind="note_on",  note=n).events if e.data2 > 0]

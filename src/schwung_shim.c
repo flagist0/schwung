@@ -5799,6 +5799,37 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
     /* Drain MIDI inject SHM into MIDI_IN (after all filtering, before barrier) */
     shadow_drain_midi_inject();
 
+    /* === STATE-ONLY MIRROR FROM INJECT RING ===
+     * The post-ioctl track-button handler (below) scans hardware_mmap_addr,
+     * which never contains injected events (those go through
+     * shadow_drain_midi_inject into the *shadow* buffer). For test-bus and
+     * other inject sources to leave a coherent trace in shadow_control's
+     * state mirror (move_ui_mode, selected_slot, ui_slot), do a tiny
+     * side-effect-free scan over the shadow buffer JUST for track CCs.
+     * No mute/solo/shift-vol/UI side effects — those need real hardware
+     * events because they observe held-state from other CCs. */
+    if (shadow && shadow_inprocess_ready && shadow_control) {
+        uint8_t *sh_state = shadow + MIDI_IN_OFFSET;
+        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+            uint8_t cin   = sh_state[j] & 0x0F;
+            uint8_t cable = (sh_state[j] >> 4) & 0x0F;
+            if (cable != 0x00 || cin != 0x0B) continue;
+            uint8_t status = sh_state[j + 1];
+            uint8_t d1     = sh_state[j + 2];
+            uint8_t d2     = sh_state[j + 3];
+            if ((status & 0xF0) != 0xB0) continue;
+            if (d1 < 40 || d1 > 43) continue;            /* Track CC range */
+            if (d2 == 0) continue;                       /* Release only */
+            shadow_control->move_ui_mode = 2;            /* NOTE */
+            int new_slot = 43 - d1;                      /* CC43->0..CC40->3 */
+            if (new_slot != shadow_selected_slot) {
+                shadow_selected_slot = new_slot;
+                shadow_control->selected_slot = (uint8_t)new_slot;
+                shadow_control->ui_slot       = (uint8_t)new_slot;
+            }
+        }
+    }
+
     /* Debug: dump raw HW MIDI_IN vs shadow MIDI_IN on inject */
     {
         static int inject_dump_count = 0;
