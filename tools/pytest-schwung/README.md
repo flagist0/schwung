@@ -215,7 +215,94 @@ one per pad. Index 0 = note 68 (track 4 pad A), index 31 = note 99
 * Streams for `midi_in`, `log`, `audio` (only `midi_out` so far)
 * Display framebuffer snapshots + syrupy diffing
 * Module state providers (`host_register_test_state`)
-* `device_files` fixture for SSH-backed file ops
+* `device_files` fixture for SSH-backed file ops (needed for the
+  `pristine_set` fixture that combines a Settings.json `currentSongIndex`
+  patch with `fresh_move` — would let tests start from a known empty
+  set instead of "whatever song was last loaded")
 * Combinator helpers (`bus.wait_all`)
 * Server-side sub-filters on subscriptions (`midi_out:cable=0,status=note_off`) — for now, filter client-side via `cap.filter(...)`
 * Audio fixture WAV-as-line-in injection
+
+## Writing tests — pitfalls hard-won on hardware
+
+The following are gotchas that bit while building the existing test suite.
+They are listed once here rather than commented at every site that uses
+them.
+
+### Cable 0 carries MIDI *and* LED writes
+
+Move emits pad-LED updates as `note_on` packets on cable 0 (the note
+number identifies the pad, the velocity byte carries the color). A
+"stuck note" test that matches `note_on(note=N)` on cable 0 will
+trigger on every pad LED update for note N — including ones the test
+itself caused. Real outgoing notes (to a downstream synth via USB) go
+on **cable 2**. Filter to `cable=2` for stuck-note assertions, accept
+that the test skips when no track is armed to USB MIDI OUT.
+
+```py
+cap = midi_out_capture.drain().filter(cable=2)
+if len(cap) == 0:
+    pytest.skip("no track armed to USB MIDI OUT")
+```
+
+### `move_ui_mode` and `selected_slot` mirror — covered for track CCs only
+
+The shim's post-merge scan updates `move_ui_mode` and `selected_slot`
+when a track CC (40-43) appears in the inject ring. **Other modifier
+state — `shift_held` in particular — is hardware-only** (the shim's
+shift handler runs additional debounce logic that the mirror skips).
+If your test depends on `state.shift_held`, you must press shift on
+the physical device; injecting CC 49 will inject but won't update the
+mirror.
+
+### Pad LED color drift is normal
+
+Move shifts neighboring pads' brightness by ±1 byte during multi-pad
+presses (e.g. a base color of `0x7B` can read as `0x7A` while another
+pad is held). Exact-byte assertions on pad LED state are flaky for
+this reason. Prefer:
+
+* delta semantics (`after[i] != initial[i]` for indices we touched,
+  unchanged for the rest)
+* "not the bright press-glow color" rather than "equal to baseline"
+* a settle window of 30 frames after release (Move holds the
+  press-glow color for 15-25 frames before fading)
+
+### Step LED colors: 0x5E base, 0x7A lit (per current set)
+
+The faded ~0x5E base color shown on dim sequencer steps is NOT the
+same as "step has no slot" (which would be 0). Don't treat
+`step_leds[i] != 0` as "step is lit"; instead capture before/after
+and look at the delta direction.
+
+### Step toggling depends on note-edit mode
+
+`ToggleStep` (and any step-pad injection) only flips the sequencer
+state when Move is in NOTE view. With the shim state-mirror landed,
+tapping any track button enters NOTE — see `SelectTrack(n)` for the
+canonical setup step. Without that, step-pad injection does nothing
+visible and the test silently passes a no-op.
+
+### `bus` fixture is session-scoped, `commander` is per-test
+
+`bus` opens one TCP connection at session start and keeps it open
+across all tests — so the daemon sees ONE client throughout the run.
+That client's per-connection state (current subscription, etc.) is
+shared across tests, which is why `midi_out_capture` carefully
+subscribes / unsubscribes around its body.
+
+`commander` is per-test and auto-undoes on teardown. Use it for
+any sequence of UI actions; the test body composes
+`commander.do(Cmd())` calls and gets free reversal at the end.
+
+### Long teardown chains can outlast SSH idle timeouts
+
+Restart-move-style tests freeze the shim for ~3 seconds. Combined
+with `commander.undo_all()`'s own waits, a single test can hold the
+connection idle for tens of seconds. The SSH tunnel from the dev
+machine needs `ServerAliveInterval=30` set or the kernel will idle
+it out and the next test sees a stale socket. Use:
+
+```
+ssh -o ServerAliveInterval=30 -L 47777:localhost:47777 ableton@move.local -N
+```

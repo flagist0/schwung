@@ -62,9 +62,20 @@ Protocol commands:
 - **`INJECT_MIDI <hex8>`** → push one USB-MIDI packet to the inject ring (lock-free MPSC; coexists with JS host + shim writers)
 - **`WAIT_FRAME <N>`** → block until shim's SPI counter advances by N
 - **`SNAPSHOT_PAD_LEDS`** → 32 bytes of pad LED color (notes 68-99)
-- **`STATE`** → snapshot of `shadow_control_t` fields (move_ui_mode / overtake_mode / shift_held / selected_slot / ui_slot / shim_counter), used as precondition source by Command-pattern UI tests
+- **`SNAPSHOT_STEP_LEDS`** → 16 bytes of sequencer-step LED color (notes 16-31)
+- **`STATE`** → snapshot of `shadow_control_t` fields (move_ui_mode / overtake_mode / shift_held / selected_slot / ui_slot / shim_counter / transport_playing), used as precondition source by Command-pattern UI tests
 - **`SUBSCRIBE <channel>`** / **`DUMP <channel>`** / **`UNSUBSCRIBE <channel>`** → streams (currently `midi_out`; add new channels by extending `g_streams[]` in `src/host/test_daemon/commands.c`)
+- **`RESTART_MOVE`** → write `shadow_control.restart_move=1` to trigger `restart-move.sh` (used by L2 reset). Daemon survives; pair with the Python client's `wait_for_shim_ready()` for the freeze→thaw cycle.
 - **`QUIT`** → server closes the connection
+
+Inject-event state mirror (since 2026-05-17): the shim's post-merge scan
+also updates `move_ui_mode` and `selected_slot` / `ui_slot` from injected
+track-CC events (40-43, reversed mapping `slot = 43 - cc`). This lets
+Commander preconditions trust `bus.state()` after a `SelectTrack(n)`.
+Modifier state (`shift_held`) is **not** mirrored — its hardware handler
+relies on debounce state that the side-effect-free mirror skips. Tests
+that need shift can still observe its effects via behavioral assertions,
+just not via `state.shift_held`.
 
 Python API exposes both the raw primitives (`bus.inject_midi`, `bus.snapshot_pad_leds`, `bus.subscribe/dump/unsubscribe`) and a Command-pattern layer for reversible UI flows:
 
@@ -86,10 +97,26 @@ Out of scope (tracked in #2): syrupy display snapshots, module state providers (
 
 **Test reset strategy** (three tiers — pick the cheapest that fits):
 - **L1 in-test undo** — Commander pattern. Microsecond cost per action. Best for tight-loop tests, undo-correctness tests, composable jestures via `commander.do(EnterTrackMenu())` style. See `tools/pytest-schwung/src/schwung_bus/commander.py` + `move_commands.py`.
-- **L2 per-test pristine** — patch Settings.json `currentSongIndex` + trigger `restart-move.sh` via shim's `shadow_control_t.restart_move` flag. **~4 seconds end-to-end** (measured on Move v2.0.0). Daemon survives, shim re-uses SHM. Default for most tests once `pristine_set` fixture lands.
+- **L2 per-test fast reset** — `fresh_move` fixture: trigger `restart-move.sh` via the daemon's RESTART_MOVE command, ~3 s freeze→thaw. Move comes back on the same set with the same `currentSongIndex`, but transient state (active overtake, held modifiers, edit-mode position) is reset. See `tests/e2e/test_fresh_move.py`.
+- **L2+ per-test pristine** — *not yet implemented.* Would extend `fresh_move` with a Settings.json `currentSongIndex` patch via a minimal SSH helper, so tests start from a known-empty template set. Needs (a) the SSH file-ops helper, (b) a pre-created empty template set on the device with a known UUID. Add as `pristine_set` fixture once the design is settled (paths: which file, which fields, where to ship the template from).
 - **L3 nuclear** — `POST /api/v1/update/reboot` (HTTP API with 30-day auth-token cookie). ~30-45 seconds. Session-scoped, rare; full OS state reset.
 
-Direct programmatic "switch to song X" is **not exposed** by Move firmware (verified via D-Bus + HTTP + SQLite investigation 2026-05-17 — see memory `project_move_firmware_internals.md`). Move is device-driven by design; L2 is the closest thing to a clean reset.
+Direct programmatic "switch to song X" is **not exposed** by Move firmware (verified via D-Bus + HTTP + SQLite investigation 2026-05-17 — see memory `project_move_firmware_internals.md`). Move is device-driven by design; L2 / L2+ are the closest things to a clean reset.
+
+**Current test inventory** (`tests/e2e/`):
+- `test_smoke.py` — ping, frame-counter, pad LED round-trip
+- `test_protocol_validation.py` — protocol error paths (rejects bad hex, out-of-range frames, unknown verbs)
+- `test_fresh_move.py` — L2 reset via RESTART_MOVE + freeze/thaw detection
+- `test_commander_smoke.py` — Command pattern: precondition, do/undo, LIFO teardown
+- `test_state_mirror.py` — shim mirror covers track-CC → `selected_slot` / `move_ui_mode` for injected events
+- `test_four_on_the_floor.py` — sequencer step toggles via Commander, delta-semantics LED assertions
+- `test_pad_release.py` — press-glow LED clears after release (stuck-pad regression)
+- `test_midi_out_stream.py` — subscribe/dump/unsubscribe + stuck-notes regressions (filter to cable=2 for real outgoing notes; cable=0 carries LED writes in note_on wire format)
+
+When extending: pad LED color reads are flaky ±1 byte due to Move's
+contextual brightness, so prefer delta semantics over absolute-color
+matches. See `tools/pytest-schwung/README.md` for the full pitfalls
+guide.
 
 ## Device Constraints
 
