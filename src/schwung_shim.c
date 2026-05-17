@@ -5807,10 +5807,20 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
      * state mirror (move_ui_mode, selected_slot, ui_slot), do a tiny
      * side-effect-free scan over the shadow buffer JUST for track CCs.
      * No mute/solo/shift-vol/UI side effects — those need real hardware
-     * events because they observe held-state from other CCs. */
+     * events because they observe held-state from other CCs.
+     *
+     * Stride: 8 bytes (4 USB-MIDI + 4 XMOS timestamp per shadow_midi.c's
+     * shadow_drain_midi_inject layout). Skipping by 4 would read into the
+     * timestamp bytes at +4..+7 and could randomly match the cable/CIN
+     * filter on noisy timer data, silently corrupting selected_slot. Bound
+     * is 31 events × 8 = 248 bytes — the actual extent of MIDI_IN inside
+     * MIDI_BUFFER_SIZE (256). Iterating up to 256 would step into the
+     * adjacent display-status region. */
     if (shadow && shadow_inprocess_ready && shadow_control) {
         uint8_t *sh_state = shadow + MIDI_IN_OFFSET;
-        for (int j = 0; j < MIDI_BUFFER_SIZE; j += 4) {
+        const int SHADOW_MIDI_IN_STRIDE = 8;
+        const int SHADOW_MIDI_IN_BYTES  = 31 * SHADOW_MIDI_IN_STRIDE;  /* 248 */
+        for (int j = 0; j < SHADOW_MIDI_IN_BYTES; j += SHADOW_MIDI_IN_STRIDE) {
             uint8_t cin   = sh_state[j] & 0x0F;
             uint8_t cable = (sh_state[j] >> 4) & 0x0F;
             if (cable != 0x00 || cin != 0x0B) continue;
@@ -5819,7 +5829,7 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
             uint8_t d2     = sh_state[j + 3];
             if ((status & 0xF0) != 0xB0) continue;
             if (d1 < 40 || d1 > 43) continue;            /* Track CC range */
-            if (d2 == 0) continue;                       /* Release only */
+            if (d2 == 0) continue;                       /* Skip release (d2==0); only mirror on press */
             shadow_control->move_ui_mode = 2;            /* NOTE */
             int new_slot = 43 - d1;                      /* CC43->0..CC40->3 */
             if (new_slot != shadow_selected_slot) {

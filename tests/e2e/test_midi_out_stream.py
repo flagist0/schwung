@@ -17,6 +17,24 @@ from __future__ import annotations
 import pytest
 
 
+def _count_ons_offs(cap, note):
+    """Count real note-ons vs. all note-offs (explicit + velocity-0) for ``note``.
+
+    Some firmwares emit note-off as note-on with velocity 0 (running-status
+    convention). Splitting those out keeps the balance assertion honest;
+    treating vel-0 note-ons as note-ons would falsely flag every
+    well-behaved release as a stuck note. Used by both stuck-note tests
+    in this file so the rule stays in one place.
+
+    Returns ``(real_on_count, total_off_count)``.
+    """
+    note_ons      = cap.filter(kind="note_on",  note=note).events
+    note_offs     = cap.filter(kind="note_off", note=note).events
+    implicit_offs = [e for e in note_ons if e.data2 == 0]
+    real_ons      = [e for e in note_ons if e.data2 > 0]
+    return len(real_ons), len(note_offs) + len(implicit_offs)
+
+
 def test_subscribe_dump_unsubscribe_round_trip(bus):
     """Subscribe/dump/unsubscribe primitives work without errors."""
     bus.subscribe_midi_out()
@@ -109,17 +127,7 @@ def test_no_stuck_notes_after_pad_press_release(bus, midi_out_capture):
             "Move to exercise this regression."
         )
 
-    note_ons  = cap.filter(kind="note_on",  note=note).events
-    note_offs = cap.filter(kind="note_off", note=note).events
-
-    # Note-on with velocity 0 is a logical note-off (running-status
-    # convention some firmwares use).
-    implicit_offs = [e for e in note_ons if e.data2 == 0]
-    real_ons      = [e for e in note_ons if e.data2 > 0]
-
-    total_offs = len(note_offs) + len(implicit_offs)
-    total_ons  = len(real_ons)
-
+    total_ons, total_offs = _count_ons_offs(cap, note)
     assert total_offs >= total_ons, (
         f"stuck note {note}: {total_ons} note-on(s) but only "
         f"{total_offs} note-off(s) — voice will keep ringing.\n"
@@ -127,7 +135,7 @@ def test_no_stuck_notes_after_pad_press_release(bus, midi_out_capture):
     )
 
 
-def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
+def test_track_switch_does_not_strand_notes(bus, commander, midi_out_capture):
     """Pressing a pad on one track, then switching to another track,
     should not leave a stuck note on the original track. This is the
     specific symptom the user keeps hitting in ion development.
@@ -140,7 +148,14 @@ def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
 
     Requires at least one Move track armed to USB MIDI OUT. Skips
     cleanly otherwise — that's a setup gap, not a regression.
+
+    Track switch goes through Commander so teardown reverts focus to
+    track 1, keeping cross-test isolation honest. Raw ``inject_midi``
+    for the same gesture would leave the device on track 4 with no
+    undo, contaminating any later test that reads ``selected_slot``.
     """
+    from schwung_bus.move_commands import SelectTrack
+
     pad_t1 = 92  # track 1 pad A
     pad_t4 = 68  # track 4 pad A
 
@@ -149,13 +164,9 @@ def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
     bus.release_pad(pad_t1)
     bus.wait_frame(6)
 
-    # Simulate track-button press by injecting CC 40 (Track 4 per
-    # CLAUDE.md: "Tracks: CCs 40-43, reversed: CC43=Track1, CC40=Track4").
-    # Hold for 8 frames (~23 ms) so Move's UI poller sees a real press
-    # rather than a debounced bounce.
-    bus.inject_midi(bytes([0x0B, 0xB0, 40, 127]))  # CC 40 (Track 4) on
-    bus.wait_frame(8)
-    bus.inject_midi(bytes([0x0B, 0xB0, 40, 0]))    # CC 40 release
+    # Track 4 = CC 40 (reversed: CC43=T1 .. CC40=T4). Commander's
+    # SelectTrack(4) sends the press, undo restores to track 1.
+    commander.do(SelectTrack(4, restore_to=1))
     bus.wait_frame(10)
 
     bus.press_pad(pad_t4, velocity=100)
@@ -171,11 +182,9 @@ def test_track_switch_does_not_strand_notes(bus, midi_out_capture):
         )
 
     for n in (pad_t1, pad_t4):
-        ons  = [e for e in cap.filter(kind="note_on",  note=n).events if e.data2 > 0]
-        offs = (cap.filter(kind="note_off", note=n).events
-                + [e for e in cap.filter(kind="note_on", note=n).events if e.data2 == 0])
-        assert len(offs) >= len(ons), (
-            f"stuck note {n} after track switch: {len(ons)} on(s), "
-            f"{len(offs)} off(s).\n"
+        ons, offs = _count_ons_offs(cap, n)
+        assert offs >= ons, (
+            f"stuck note {n} after track switch: {ons} on(s), "
+            f"{offs} off(s).\n"
             f"events: {[(e.kind, e.data1, e.data2, f'@{e.frame}') for e in cap.events]}"
         )

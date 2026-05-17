@@ -4,6 +4,10 @@ Tests live in ``tests/e2e/`` and require a running ``schwung-testd`` on the
 target Move (default localhost:47777, tunneled via SSH from the dev machine).
 The ``bus`` fixture comes from the ``pytest-schwung`` plugin (installed from
 ``tools/pytest-schwung``).
+
+Helpers shared across tests (e.g. ``enter_note_mode_or_skip``) live in
+``_helpers.py`` so they can be imported by absolute name. conftest.py
+stays focused on fixtures and per-test wiring.
 """
 
 from __future__ import annotations

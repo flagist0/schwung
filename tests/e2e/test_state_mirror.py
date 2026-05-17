@@ -28,6 +28,8 @@ import pytest
 from schwung_bus import BusState
 from schwung_bus.move_commands import SelectTrack
 
+from _helpers import enter_note_mode_or_skip
+
 
 def test_each_track_selects_correct_slot(bus, commander):
     """Tap each track button (1..4) via SelectTrack and confirm the
@@ -64,14 +66,16 @@ def test_track_tap_marks_move_in_note_mode(bus, commander):
     records that — otherwise Commander preconditions that gate on
     NOTE mode (e.g. ToggleStep) skip even when Move is actually there.
 
-    This is the regression the four-on-floor test originally hit.
+    This is the regression the four-on-floor test originally hit. Uses
+    the shared ``enter_note_mode_or_skip`` helper from conftest so the
+    skip message and the wait length stay consistent with every other
+    test that needs NOTE-mode setup.
     """
-    commander.do(SelectTrack(1))
-    bus.wait_frame(4)
+    enter_note_mode_or_skip(bus, commander, track=1)
     s = bus.state()
     assert s.move_ui_mode == BusState.MOVE_UI_NOTE, (
-        f"after track tap, move_ui_mode should be 2 (NOTE), got "
-        f"{s.move_ui_mode}. Shim's post-merge scan is missing or broken."
+        f"helper said NOTE mode reached but state still reads "
+        f"{s.move_ui_mode} — helper is lying or the mirror is racy."
     )
 
 

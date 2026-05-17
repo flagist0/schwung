@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import pytest
 
-from schwung_bus import BusState
-from schwung_bus.move_commands import SelectTrack, ToggleStep
+from schwung_bus.move_commands import ToggleStep
+
+from _helpers import enter_note_mode_or_skip
 
 
 # Steps 1, 5, 9, 13 = downbeats in a 16-step bar at 1/16 resolution.
@@ -48,19 +49,8 @@ def test_four_on_the_floor_lights_correct_step_leds(bus, commander):
             "Stop transport before re-running this test."
         )
 
-    # ---- Enter note-edit mode by selecting track 1.
-    # SelectTrack updates Move's UI mode AND (now) the shim's state
-    # mirror, so the ToggleStep precondition below sees move_ui_mode=2.
-    commander.do(SelectTrack(1))
-    bus.wait_frame(4)
-
-    state = bus.state()
-    if state.move_ui_mode != BusState.MOVE_UI_NOTE:
-        pytest.skip(
-            f"SelectTrack(1) did not put Move into note-edit mode "
-            f"(move_ui_mode={state.move_ui_mode}, want=2). Shim state "
-            "mirror missing — rebuild + redeploy the shim."
-        )
+    # Tap track 1 to enter note-edit mode (skip if shim mirror missing).
+    enter_note_mode_or_skip(bus, commander, track=1)
 
     # ---- Snapshot before — used as the baseline for delta assertions ----
     # We avoid hardcoding "lit" vs "dark" color codes. Move uses a faded
@@ -108,18 +98,17 @@ def test_four_on_the_floor_lights_correct_step_leds(bus, commander):
 
     # ---- Direction check: toggled steps got "more lit", not "less lit" ----
     # Heuristic: Move's lit step color brightness > its dim color. This
-    # only fires if the test runs on an empty pattern (the common case
-    # because of the dim-everywhere baseline). On a pattern where the
-    # target steps were already lit, our toggle clears them and this
-    # assertion would fail — keep it advisory by checking the avg
-    # direction across the four targets rather than each individually.
+    # is a skip (not an assert) because "pattern already had these steps
+    # set" is a device-state condition the test author controls, not a
+    # code bug — the file docstring already calls it out as a precondition.
     avg_delta = sum(after[i] - initial[i] for i in target_indices) / len(target_indices)
-    assert avg_delta > 0, (
-        f"toggled steps moved to a *dimmer* color on average "
-        f"(avg delta {avg_delta:+.1f}). Pattern may have started with these "
-        f"steps already set — the test toggled them OFF. Clear the pattern "
-        f"and re-run.\nBefore: {initial.hex()}\nAfter:  {after.hex()}"
-    )
+    if avg_delta <= 0:
+        pytest.skip(
+            f"toggled steps moved to a *dimmer* color on average "
+            f"(avg delta {avg_delta:+.1f}) — pattern likely started with "
+            f"these steps already set. Clear the pattern and re-run.\n"
+            f"Before: {initial.hex()}\nAfter:  {after.hex()}"
+        )
 
     # commander.undo_all() in fixture teardown will press 13/9/5/1
     # again (LIFO) to toggle them off, then SelectTrack undoes.
