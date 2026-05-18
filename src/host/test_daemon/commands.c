@@ -193,17 +193,26 @@ static int cmd_state(int fd, const char *args) {
     shadow_control_t       *c = g_shm.control;
     shadow_overlay_state_t *o = g_shm.overlay;
     char line[TESTD_LINE_MAX];
+    /* Add fields one at a time as tests need new preconditions; never
+     * remove or rename, that's a protocol break. Jack-detect fields
+     * (speaker_active / line_in_connected) are the first invariants
+     * we want to verify from injected CC 115/114. display_mode is
+     * the "shadow UI displayed?" gate. */
     snprintf(line, sizeof(line),
              "OK move_ui_mode=%u overtake_mode=%u shift_held=%u "
              "selected_slot=%u ui_slot=%u shim_counter=%u "
-             "transport_playing=%u",
+             "transport_playing=%u speaker_active=%u "
+             "line_in_connected=%u display_mode=%u",
              (unsigned)c->move_ui_mode,
              (unsigned)c->overtake_mode,
              (unsigned)c->shift_held,
              (unsigned)c->selected_slot,
              (unsigned)c->ui_slot,
              (unsigned)c->shim_counter,
-             (unsigned)o->transport_playing);
+             (unsigned)o->transport_playing,
+             (unsigned)c->speaker_active,
+             (unsigned)c->line_in_connected,
+             (unsigned)c->display_mode);
     return protocol_reply(fd, line);
 }
 

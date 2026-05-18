@@ -45,13 +45,21 @@ class BusState:
     as commands need more granularity. Display-diff is never used
     for preconditions — too fragile.
     """
-    move_ui_mode: int      # 0=unknown, 1=session, 2=note, 3=set_overview
-    overtake_mode: int     # 0=normal, 1=menu, 2=module (schwung overlay)
-    shift_held: int        # 0/1 — modifier
-    selected_slot: int     # 0..3 — schwung slot focus
-    ui_slot: int           # 0..3 — schwung slot for knob routing
-    shim_counter: int      # SPI tick counter at moment of probe
-    transport_playing: int # 0=stopped, 1=playing (from overlay, set by MIDI Start/Stop)
+    move_ui_mode: int       # 0=unknown, 1=session, 2=note, 3=set_overview
+    overtake_mode: int      # 0=normal, 1=menu, 2=module (schwung overlay)
+    shift_held: int         # 0/1 — modifier
+    selected_slot: int      # 0..3 — schwung slot focus
+    ui_slot: int            # 0..3 — schwung slot for knob routing
+    shim_counter: int       # SPI tick counter at moment of probe
+    transport_playing: int  # 0=stopped, 1=playing (from overlay, set by MIDI Start/Stop)
+    # Fields below default to 0 so older test code (or tests that
+    # manually construct a fake state for monkey-patching) keeps
+    # working without listing every field. Add new fields here, not
+    # above; older daemons answering STATE without these keys produce
+    # 0 via the `.get(..., 0)` in `state()`.
+    speaker_active: int = 0     # 1=built-in speaker live (no headphones); 0=jack plugged
+    line_in_connected: int = 0  # 1=line-in cable plugged; 0=using internal mic
+    display_mode: int = 0       # 0=Move-native UI; 1=shadow UI displayed
 
     # Enum mirrors for readability in tests.
     MOVE_UI_UNKNOWN      = 0
@@ -414,7 +422,9 @@ class SchwungBus:
 
         Read-only, no side effects. Extend the daemon's STATE response
         (and this parser) one field at a time as new commands need
-        more precondition granularity.
+        more precondition granularity. Fields added after v0.1 default
+        to 0 if the daemon is older — tests that depend on them should
+        skip when the field is missing rather than crash.
         """
         line = self._request("STATE")
         fields: dict[str, int] = {}
@@ -435,6 +445,15 @@ class SchwungBus:
                 ui_slot=fields["ui_slot"],
                 shim_counter=fields["shim_counter"],
                 transport_playing=fields["transport_playing"],
+                # Defaults so an older daemon still produces a valid
+                # BusState; tests gating on these fields should also
+                # check ``state.X is not None`` if we ever switch to
+                # Optional[int]. For now zeros are safe sentinels —
+                # invariant tests assert state transitions, so a stuck-
+                # zero from an old daemon fails loudly with "didn't flip".
+                speaker_active=fields.get("speaker_active", 0),
+                line_in_connected=fields.get("line_in_connected", 0),
+                display_mode=fields.get("display_mode", 0),
             )
         except KeyError as e:
             raise SchwungBusError(f"STATE: missing field {e}") from e
