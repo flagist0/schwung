@@ -271,7 +271,7 @@ def test_restart_move_resets_selected_slot(bus, commander, fresh_move):
     )
 
 
-def test_restart_move_does_not_reset_move_ui_mode(bus, fresh_move):
+def test_restart_move_does_not_reset_move_ui_mode(bus, commander):
     """Documents the CURRENT shim behavior: ``move_ui_mode`` persists
     across restart-move. The shim's ``shm_init`` reset list (per
     517fa4f0) is exactly ``overtake_mode / suspend_overtake /
@@ -282,26 +282,35 @@ def test_restart_move_does_not_reset_move_ui_mode(bus, fresh_move):
     knowing about; if a test ever assumes a clean ``move_ui_mode``
     after restart, that test will see stale state.
 
+    Test owns its own precondition (does NOT use the ``fresh_move``
+    fixture): we tap a track to set move_ui_mode=2, then trigger
+    the restart manually and wait for thaw. That way the test is
+    independent of whatever the previous test left behind — pytest
+    reordering, `-k` filtering, or running this in isolation all
+    produce the same observable.
+
     Marked as the contract, not a regression: change the assertion if
     the shim is updated to reset ``move_ui_mode`` too.
     """
-    # Use SelectTrack BEFORE the restart so the mirror is at 2.
-    # But fresh_move ran in setup, so the prior state is whatever the
-    # last test left. We can only check that *if* the prior state had
-    # move_ui_mode=2, restart didn't reset it.
+    # Own the precondition: tap a track so move_ui_mode=2.
+    commander.do(SelectTrack(1))
+    bus.wait_frame(4)
+    pre = bus.state()
+    assert pre.move_ui_mode == 2, (
+        f"setup failed: SelectTrack(1) didn't reach NOTE mode "
+        f"(move_ui_mode={pre.move_ui_mode}). Shim mirror gone?"
+    )
+
+    # Manual restart (not the fixture — that ran before this test body).
+    bus.restart_move()
+    bus.wait_for_shim_ready(timeout=15)
+
     s = bus.state()
-    # No assert on direction — just record the current value with a
-    # message so a future regression on either side is visible.
-    if s.move_ui_mode == 0:
-        pytest.skip(
-            "prior test left move_ui_mode=0 already, can't observe "
-            "the persistence contract from this side. Run after a "
-            "test that taps a track button."
-        )
     assert s.move_ui_mode == 2, (
         f"move_ui_mode after restart-move is {s.move_ui_mode} — "
-        f"expected 2 (persisted from prior test). If the shim now "
-        f"resets it, update this test and the documentation."
+        f"expected 2 (persisted from before the restart we just did). "
+        f"If the shim now resets it, update this test and the docs in "
+        f"CLAUDE.md."
     )
 
 

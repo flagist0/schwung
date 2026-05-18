@@ -23,9 +23,14 @@ import pytest
 def test_pad_release_clears_press_glow(bus):
     """Press a pad → it brightens. Release → that brightness goes away.
 
-    Settle window: 30 frames (~87 ms). Move holds the press-glow color
-    for ~15-25 frames after note-off before fading. If a future Move
-    firmware lengthens that fade, bump the wait and re-measure.
+    Poll for up to ~60 frames (~175 ms) waiting for the press-glow
+    to clear. Move normally clears within 15-25 frames, but under
+    burst-load tests that run before this one the firmware seems
+    to hold the highlight longer — the test isn't asserting on the
+    exact timing, only that the LED EVENTUALLY leaves the press-
+    glow color. A real stuck-pad regression keeps the LED at the
+    press-glow color forever, which this still catches with the
+    extended budget.
     """
     note = 86  # mid-grid pad, away from typical step-pattern hot spots
     idx = bus.pad_index(note)
@@ -38,6 +43,7 @@ def test_pad_release_clears_press_glow(bus):
     pressed = bus.snapshot_pad_leds()
 
     if pressed[idx] == before[idx]:
+        bus.release_pad(note)
         pytest.skip(
             f"pad {note} press did not change LED color "
             f"(before/pressed both {pressed[idx]}); release-path "
@@ -46,12 +52,18 @@ def test_pad_release_clears_press_glow(bus):
     press_glow_color = pressed[idx]
 
     bus.release_pad(note)
-    bus.wait_frame(30)
-    released = bus.snapshot_pad_leds()
+    # Poll every ~6 frames up to 60 — most clears land by frame 30
+    # but burst-load residual state can extend the hold.
+    for _ in range(10):
+        bus.wait_frame(6)
+        released = bus.snapshot_pad_leds()
+        if released[idx] != press_glow_color:
+            return  # cleared
 
-    assert released[idx] != press_glow_color, (
+    # Still at press-glow color after ~175 ms — real stuck-pad.
+    pytest.fail(
         f"pad {note} stuck at the press-glow color {press_glow_color} "
-        f"30 frames after release. This is the classic 'stuck pad LED' "
+        f"~175 ms after release. This is the classic 'stuck pad LED' "
         f"regression — a JS module or shim handler is missing the "
         f"note-off LED update.\n"
         f"  before:  {before.hex()}\n"

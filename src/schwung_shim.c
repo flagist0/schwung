@@ -5818,8 +5818,12 @@ static void shim_post_transfer(void *ctx, uint8_t *shadow, const uint8_t *hw, in
      * adjacent display-status region. */
     if (shadow && shadow_inprocess_ready && shadow_control) {
         uint8_t *sh_state = shadow + MIDI_IN_OFFSET;
-        const int SHADOW_MIDI_IN_STRIDE = 8;
-        const int SHADOW_MIDI_IN_BYTES  = 31 * SHADOW_MIDI_IN_STRIDE;  /* 248 */
+        /* Stride from the canonical struct; event count from the canonical
+         * macro. Both live in lib/schwung_spi_lib.h. Local magic numbers
+         * would silently desync if SchwungMidiEvent ever gains padding
+         * or SCHWUNG_MIDI_IN_MAX changes. */
+        const int SHADOW_MIDI_IN_STRIDE = (int)sizeof(SchwungMidiEvent);  /* 8 */
+        const int SHADOW_MIDI_IN_BYTES  = SCHWUNG_MIDI_IN_MAX * SHADOW_MIDI_IN_STRIDE;  /* 248 */
         for (int j = 0; j < SHADOW_MIDI_IN_BYTES; j += SHADOW_MIDI_IN_STRIDE) {
             uint8_t cin   = sh_state[j] & 0x0F;
             uint8_t cable = (sh_state[j] >> 4) & 0x0F;
