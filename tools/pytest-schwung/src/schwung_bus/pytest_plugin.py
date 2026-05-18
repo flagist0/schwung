@@ -1,31 +1,43 @@
 """Pytest entry point for pytest-schwung.
 
 Fixtures:
-  ``bus``               session-scoped SchwungBus, connected and
-                        ping-validated. Auto-skips collected tests if
-                        the daemon is unreachable.
-  ``commander``         function-scoped Commander for UI tests with
-                        auto-undo on teardown.
-  ``fresh_move``        L2 reset: trigger restart-move.sh, wait for shim.
-                        ~3 s. Same set, transient state cleared.
-  ``pristine_set``      L2+ reset: overwrite Move's test-template Song.abl
-                        with the repo's canonical empty version, then
-                        restart-move. ~3 s plus an ssh cp (~30 ms over
-                        the persistent ControlMaster). Use when tests
-                        need a deterministic starting set instead of
-                        whatever the user happened to leave loaded.
-  ``midi_out_capture``  function-scoped MidiOutSession. The fixture
-                        subscribes on setup, yields a session handle,
-                        unsubscribes on teardown. Tests call
-                        ``session.drain()`` to read captured events
-                        (multiple times in one test is fine — each drain
-                        returns events since the last).
+  ``bus``                  session-scoped SchwungBus, connected and
+                           ping-validated. Auto-skips collected tests if
+                           the daemon is unreachable.
+  ``commander``            function-scoped Commander for UI tests with
+                           auto-undo on teardown.
+  ``fresh_move``           L2 reset: trigger restart-move.sh, wait for shim.
+                           ~3 s. Same set, transient state cleared.
+  ``pristine_set``         L2+ function-scoped: overwrite Move's
+                           test-template Song.abl with the repo's
+                           canonical empty version, then restart-move.
+                           ~3 s per test. Relies on a session-scoped
+                           xattr swap (see ``_template_staged``) so
+                           that Move resolves ``currentSongIndex`` to
+                           our template UUID without needing to touch
+                           Settings.json.
+  ``pristine_set_class``   L2+ class-scoped: same as ``pristine_set``
+                           but fires once per ``class`` test group.
+                           Tests in the same class run in declaration
+                           order and share evolving state. Useful for
+                           short scenario tests where you don't want
+                           to pay 3 s per micro-step. Ordering matters
+                           — tests later in the class can depend on
+                           setup from earlier tests.
+  ``midi_out_capture``     function-scoped MidiOutSession. The fixture
+                           subscribes on setup, yields a session handle,
+                           unsubscribes on teardown. Tests call
+                           ``session.drain()`` to read captured events
+                           (multiple times in one test is fine — each
+                           drain returns events since the last).
 """
 
 from __future__ import annotations
 
+import json
 import shlex
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +50,16 @@ from .pristine_constants import (
     TEMPLATE_DEVICE_SONG_PATH,
     TEMPLATE_UUID,
 )
+
+
+# Where on the device we record the xattr-swap state that the
+# pristine fixture must restore on teardown. Persisted across the
+# session so a crash mid-test (Ctrl+C, OOM, network loss) can be
+# auto-recovered by the next session start.
+SETS_ROOT_ON_DEVICE = "/data/UserData/UserLibrary/Sets"
+SETTINGS_ON_DEVICE  = "/data/UserData/settings/Settings.json"
+RECOVERY_FILE       = "/data/UserData/schwung/_pristine_xattr_recovery.json"
+TEMPLATE_DIR_ON_DEVICE = f"{SETS_ROOT_ON_DEVICE}/{TEMPLATE_UUID}"
 
 
 def _do_restart(bus, timeout: int = 15) -> None:
@@ -132,17 +154,116 @@ def device_files():
     dev.close()
 
 
+def _get_xattr(device_files, path: str, name: str) -> str | None:
+    """Read a Linux extended file attribute via SSH. Returns the value
+    string (xattrs on the device are stored as ASCII ints/colors), or
+    None if the attribute doesn't exist or path is missing.
+    """
+    res = device_files.run(
+        f"getfattr -n {shlex.quote(name)} --only-values {shlex.quote(path)} 2>/dev/null",
+        check=False,
+    )
+    if res.returncode != 0:
+        return None
+    return res.stdout
+
+
+def _set_xattr(device_files, path: str, name: str, value: str) -> None:
+    """Write a Linux extended file attribute via SSH."""
+    device_files.run(
+        f"setfattr -n {shlex.quote(name)} -v {shlex.quote(value)} {shlex.quote(path)}"
+    )
+
+
+def _find_uuid_at_index(device_files, target_index: str) -> str | None:
+    """Find which set's directory has user.song-index = ``target_index``.
+
+    Reverse-engineered from MoveOriginal: Move resolves
+    ``currentSongIndex`` (in Settings.json) by linear-scanning all
+    set directories and picking the one whose ``user.song-index``
+    xattr matches. Returns that set's UUID, or None if no set
+    currently claims that index (which would make Move generate a
+    phantom UUID via loadDefaultSong on the next load).
+
+    Raises if MULTIPLE sets claim the same index — that's corrupt
+    state (we don't know which Move would actually pick) and silently
+    operating on one of them would leave a duplicate after teardown.
+    """
+    cmd = (
+        f'for d in {SETS_ROOT_ON_DEVICE}/*/; do '
+        f'  uuid=$(basename "$d"); '
+        f'  idx=$(getfattr -n user.song-index --only-values "$d" 2>/dev/null); '
+        f'  if [ "$idx" = {shlex.quote(target_index)} ]; then echo "$uuid"; fi; '
+        f'done'
+    )
+    res = device_files.run(cmd)
+    lines = [l for l in res.stdout.strip().split('\n') if l]
+    if len(lines) > 1:
+        raise RuntimeError(
+            f"multiple sets claim user.song-index={target_index!r}: {lines}. "
+            "Device xattr state is corrupt — fix manually before running tests."
+        )
+    return lines[0] if lines else None
+
+
+def _all_song_indices(device_files) -> set[int]:
+    """Return the set of currently-used user.song-index values across
+    all set directories. Used to pick a safe sentinel value that's
+    guaranteed not to collide with any existing set.
+    """
+    cmd = (
+        f'for d in {SETS_ROOT_ON_DEVICE}/*/; do '
+        f'  getfattr -n user.song-index --only-values "$d" 2>/dev/null; '
+        f'  echo; '
+        f'done'
+    )
+    res = device_files.run(cmd)
+    indices: set[int] = set()
+    for line in res.stdout.split('\n'):
+        line = line.strip()
+        if line.isdigit():
+            indices.add(int(line))
+    return indices
+
+
+def _pick_sentinel_index(device_files) -> str:
+    """Pick a user.song-index value not currently in use by any set.
+
+    Used when the template has no xattr at all and we need to give
+    the displaced "holder" set a non-conflicting temporary value.
+    Returns one past the max — avoids collisions with any current
+    set, even ones at high indices (we saw 30 on real hardware).
+    """
+    used = _all_song_indices(device_files)
+    return str((max(used) + 1) if used else 1000)
+
+
 @pytest.fixture(scope="session")
 def _template_staged(device_files):
     """Stage the repo's canonical empty_song.abl onto Move once
-    per session. Per-test ``pristine_set`` then does a local `cp`
-    on the device (no network) to copy it into place.
+    per session AND swap the user.song-index xattrs so Move's current
+    ``currentSongIndex`` (in Settings.json) resolves to our template.
 
-    Verifies the template UUID dir actually exists on Move — if the
-    user deleted or renamed _TEST_TEMPLATE without re-capturing the
-    UUID in pristine_constants.py, this fixture fails fast with a
-    clear message instead of letting per-test fixtures fail with
-    ``cp: dest not found`` on every test.
+    Why the xattr swap (the part that makes pristine_set actually work):
+      Move's song-list is built by scanning ``Sets/*/`` and reading
+      each directory's ``user.song-index`` extended attribute (ext4
+      xattr). It then matches that against ``currentSongIndex`` from
+      Settings.json. Without the swap, our template (with whatever
+      xattr it happened to be assigned at creation) is invisible to
+      Move at the index Settings.json points to — Move just loads
+      whatever set already had the matching xattr.
+
+      We perform a SWAP: our template gets the xattr value Move is
+      looking for; the set that previously had that value gets our
+      template's old value. Other sets are untouched. Settings.json
+      is untouched. On teardown the swap reverses and the user's
+      device is byte-identical to its pre-session state.
+
+    Crash recovery: the swap state is written to
+    ``/data/UserData/schwung/_pristine_xattr_recovery.json``. If the
+    session crashes and leaves the swap in place, the next session
+    detects the recovery file and restores it BEFORE applying the
+    new swap. So an interrupted session is auto-healed on next run.
     """
     if not REPO_TEMPLATE_PATH.is_file():
         pytest.skip(
@@ -150,21 +271,141 @@ def _template_staged(device_files):
             "Re-capture from the device — see pristine_constants.py."
         )
 
-    # Verify the destination dir exists on device. If not, the user
-    # likely deleted/renamed the template — bail loudly.
-    template_dir = (
-        f"/data/UserData/UserLibrary/Sets/{TEMPLATE_UUID}"
-    )
-    if not device_files.file_exists(template_dir):
+    if not device_files.file_exists(TEMPLATE_DIR_ON_DEVICE):
         pytest.skip(
-            f"template UUID dir missing on device: {template_dir}. "
+            f"template UUID dir missing on device: {TEMPLATE_DIR_ON_DEVICE}. "
             "Either the template was deleted on Move, or "
             "TEMPLATE_UUID in pristine_constants.py is stale. "
             "Recreate _TEST_TEMPLATE on Move and re-capture the UUID."
         )
 
+    # Stage the canonical Song.abl once (per-test cp from this path
+    # is local on device, ~30 ms).
     device_files.put_file(REPO_TEMPLATE_PATH, DEVICE_STAGING_PATH)
-    return DEVICE_STAGING_PATH
+
+    # --- Recover from a previous crashed session, if any. ---
+    if device_files.file_exists(RECOVERY_FILE):
+        prev = None
+        try:
+            prev = json.loads(device_files.read_text(RECOVERY_FILE))
+        except (json.JSONDecodeError, ValueError):
+            # Corrupt recovery file (truncated write, partial flush
+            # during crash). Without delete, every subsequent session
+            # would fail the same way. Drop it and proceed fresh.
+            prev = None
+
+        if prev and prev.get("template_uuid") == TEMPLATE_UUID:
+            try:
+                orig_template_xattr = prev.get("template_xattr_orig") or ""
+                if orig_template_xattr:
+                    _set_xattr(device_files, TEMPLATE_DIR_ON_DEVICE,
+                               "user.song-index", orig_template_xattr)
+                else:
+                    device_files.run(
+                        f"setfattr -x user.song-index "
+                        f"{shlex.quote(TEMPLATE_DIR_ON_DEVICE)} 2>/dev/null",
+                        check=False,
+                    )
+                holder_uuid = prev.get("holder_uuid")
+                if holder_uuid and holder_uuid != TEMPLATE_UUID:
+                    holder_dir = f"{SETS_ROOT_ON_DEVICE}/{holder_uuid}"
+                    if device_files.file_exists(holder_dir):
+                        _set_xattr(device_files, holder_dir,
+                                   "user.song-index",
+                                   prev.get("holder_xattr_orig", ""))
+            except Exception:
+                # Best-effort. If something stale (holder no longer
+                # exists, etc.) we still want to clean up the
+                # recovery file so we don't loop forever.
+                pass
+
+        device_files.run(f"rm -f {shlex.quote(RECOVERY_FILE)}")
+
+    # --- Read current state. ---
+    settings = json.loads(device_files.read_text(SETTINGS_ON_DEVICE))
+    current_index = str(settings["currentSongIndex"])
+    template_xattr_orig = _get_xattr(device_files, TEMPLATE_DIR_ON_DEVICE,
+                                     "user.song-index") or ""
+
+    # If template already has the right xattr, no swap needed. The
+    # session yields without writing a recovery file or running a
+    # restore — there's nothing to restore. Assumes
+    # ``currentSongIndex`` doesn't change mid-session (no other
+    # process editing Settings.json). If it does, subsequent
+    # pristine_set calls keep restarting Move at the new index,
+    # which won't point to our template anymore. That's an external
+    # mutation we don't try to defend against.
+    if template_xattr_orig == current_index:
+        yield DEVICE_STAGING_PATH
+        return
+
+    holder_uuid = _find_uuid_at_index(device_files, current_index)
+    holder_xattr_orig = current_index if holder_uuid else None
+    holder_dir = (f"{SETS_ROOT_ON_DEVICE}/{holder_uuid}"
+                  if holder_uuid and holder_uuid != TEMPLATE_UUID else None)
+
+    # --- Persist recovery state BEFORE mutating. ---
+    # If we crash between this write and the swap completion, next
+    # session reads this file and restores. printf+stdin redirect
+    # avoids heredoc quoting ambiguity and works regardless of how
+    # device_files.run dispatches to the remote shell.
+    recovery = {
+        "template_uuid":        TEMPLATE_UUID,
+        "template_xattr_orig":  template_xattr_orig,
+        "holder_uuid":          holder_uuid,
+        "holder_xattr_orig":    holder_xattr_orig,
+        "current_index":        current_index,
+    }
+    recovery_json = json.dumps(recovery, indent=2)
+    device_files.run(
+        f"printf '%s' {shlex.quote(recovery_json)} > {shlex.quote(RECOVERY_FILE)}"
+    )
+
+    # --- Swap: holder gets template's old value, template gets index. ---
+    if holder_dir:
+        # If template_xattr_orig is empty (template never had the
+        # xattr), pick a sentinel guaranteed not to collide with any
+        # other set's existing xattr. Naive value like "999" could
+        # collide with a real set; _pick_sentinel_index scans all
+        # current values and returns one past the max.
+        new_holder_value = template_xattr_orig or _pick_sentinel_index(device_files)
+        _set_xattr(device_files, holder_dir, "user.song-index", new_holder_value)
+    _set_xattr(device_files, TEMPLATE_DIR_ON_DEVICE, "user.song-index", current_index)
+
+    try:
+        yield DEVICE_STAGING_PATH
+    finally:
+        # --- Restore. ---
+        try:
+            if holder_dir:
+                _set_xattr(device_files, holder_dir,
+                           "user.song-index", current_index)
+            if template_xattr_orig:
+                _set_xattr(device_files, TEMPLATE_DIR_ON_DEVICE,
+                           "user.song-index", template_xattr_orig)
+            else:
+                device_files.run(
+                    f"setfattr -x user.song-index "
+                    f"{shlex.quote(TEMPLATE_DIR_ON_DEVICE)} 2>/dev/null",
+                    check=False,
+                )
+            device_files.run(f"rm -f {shlex.quote(RECOVERY_FILE)}")
+        except Exception:
+            # Teardown must never raise; the recovery file stays in
+            # place for next session to pick up.
+            pass
+
+
+def _apply_template_and_restart(bus, device_files) -> None:
+    """Body shared by pristine_set (function-scoped) and
+    pristine_set_class (class-scoped). One place that knows the cp
+    + restart protocol; if a future change wants different ordering
+    or extra verification, edit here once.
+    """
+    device_files.run(
+        f"cp {DEVICE_STAGING_PATH} {shlex.quote(TEMPLATE_DEVICE_SONG_PATH)}"
+    )
+    _do_restart(bus)
 
 
 @pytest.fixture
@@ -200,11 +441,60 @@ def pristine_set(bus, device_files, _template_staged):
     tests that need known dim baseline, pad LED tests that need
     notes-off starting state. For fast tests where Commander undo
     suffices, prefer Commander; pristine_set adds ~3 s per test.
+
+    For grouped tests that can share a pristine starting state and
+    just need to run in order, use ``pristine_set_class`` instead.
+
+    How Move's reload reaches our template (since 2026-05-18): the
+    session-scoped ``_template_staged`` fixture also swaps the
+    ``user.song-index`` xattr on Move's filesystem so the value of
+    ``currentSongIndex`` in Settings.json resolves to our template
+    UUID. RE'd from MoveOriginal — see ``_template_staged`` docs.
     """
-    device_files.run(
-        f"cp {DEVICE_STAGING_PATH} {shlex.quote(TEMPLATE_DEVICE_SONG_PATH)}"
-    )
-    _do_restart(bus)
+    _apply_template_and_restart(bus, device_files)
+    yield
+
+
+@pytest.fixture(scope="class")
+def pristine_set_class(bus, device_files, _template_staged):
+    """Class-scoped variant of ``pristine_set``: one cp + restart per
+    test class instead of per test.
+
+    Use when you have several short tests that all want a common
+    pristine starting point and don't mutually interfere — paying 3 s
+    once instead of N × 3 s.
+
+    Tests in the class run in **declaration order** (pytest preserves
+    file order within a class). Tests may rely on state set up by
+    earlier tests in the same class — that's the explicit deal here.
+    If two tests in a class need independent pristine state, they
+    belong in two separate classes.
+
+    Example::
+
+        class TestStepPatternBuildup:
+            def test_initially_empty(self, bus, pristine_set_class):
+                # snapshot is the dim baseline
+                ...
+
+            def test_step_1_toggles_on(self, bus, commander,
+                                       pristine_set_class):
+                commander.do(SelectTrack(1))
+                # ... toggle step 1, assert change ...
+
+            def test_step_5_toggles_on_alongside_step_1(self, bus,
+                                                       pristine_set_class):
+                # step 1 is still toggled on from the previous test;
+                # this test toggles step 5 ON TOP of that state.
+                ...
+
+    Scope coupling: class-scoped, shares the session-scoped ``bus``,
+    ``device_files``, ``_template_staged``. The cp + restart runs at
+    the start of the first test in the class; no teardown between
+    tests in the class. Move's state evolves freely until the next
+    class's ``pristine_set_class`` fires.
+    """
+    _apply_template_and_restart(bus, device_files)
     yield
 
 

@@ -61,19 +61,27 @@ def test_pristine_pad_press_always_lands(bus, commander, pristine_set, note):
     # the snapshot reflects the new track's layout. The state-mirror
     # updates immediately (selected_slot=1 in a few frames) but
     # Move's own UI thread is slower to repaint the pad LEDs after
-    # the restart settle. Spin up to ~50 frames waiting for the
-    # row-0 marker (any non-zero byte at col 0) to land at the
-    # melodic-track edge color (0x09).
-    for _ in range(10):
+    # the restart settle. Spin up to ~75 frames waiting for the
+    # snapshot to stabilise on the melodic-track layout: all 6
+    # inner-column pads of row 1 at PLAYABLE_COLOR (0x7B).
+    #
+    # Why a structural check instead of an edge-color literal: edge
+    # markers depend on the instrument preset and have varied across
+    # template versions (0x09 for one bass preset, 0x1a for another).
+    # The inner-column "playable" 0x7B is more stable across presets
+    # — those pads are always the chromatic playable notes.
+    for _ in range(15):
         bus.wait_frame(5)
         snap = bus.snapshot_pad_leds()
-        if snap[0] == 0x09:
+        row1 = snap[8:16]
+        if all(row1[i] == PLAYABLE_COLOR for i in range(1, 7)):
             break
     else:
         pytest.skip(
-            f"after SelectTrack(2) + 50-frame wait, pad grid still "
-            f"shows non-track-2 layout (idx 0 = {snap[0]:#04x}, expected "
-            f"0x09 edge marker). Move's UI didn't repaint in time.\n"
+            f"after SelectTrack(2) + 75-frame wait, pad grid row 1 "
+            f"isn't uniformly playable. inner-columns: "
+            f"{row1[1:7].hex()}, expected all 0x7b. Move's UI didn't "
+            f"repaint in time or template instruments changed.\n"
             f"  full grid: {snap.hex()}"
         )
 
