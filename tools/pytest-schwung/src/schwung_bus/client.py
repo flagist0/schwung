@@ -415,6 +415,27 @@ class SchwungBus:
         _check_pad_note(note)
         return note - 68
 
+    def press_step(self, note: int, velocity: int = 100) -> None:
+        """Inject a note-on for a sequencer step pad (notes 16..31)
+        on cable 0, channel 0. Use in note-edit mode to toggle steps.
+        """
+        _check_step_note(note)
+        if not 1 <= velocity <= 127:
+            raise ValueError("velocity must be 1..127 for note-on")
+        self.inject_midi(bytes([0x09, 0x90, note, velocity]))
+
+    def release_step(self, note: int, velocity: int = 0x40) -> None:
+        """Inject a note-off for a sequencer step pad on cable 0, channel 0."""
+        _check_step_note(note)
+        if not 0 <= velocity <= 127:
+            raise ValueError("release velocity must be 0..127")
+        self.inject_midi(bytes([0x08, 0x80, note, velocity]))
+
+    def step_index(self, note: int) -> int:
+        """Convert a step note (16..31) to its step_led_colors index (0..15)."""
+        _check_step_note(note)
+        return note - 16
+
     # ----- state probe (Phase 3, used as command preconditions) -------------
 
     def state(self) -> BusState:
@@ -606,6 +627,11 @@ class SchwungBus:
 def _check_pad_note(note: int) -> None:
     if not 68 <= note <= 99:
         raise ValueError(f"pad note must be 68..99, got {note}")
+
+
+def _check_step_note(note: int) -> None:
+    if not 16 <= note <= 31:
+        raise ValueError(f"step note must be 16..31, got {note}")
 
 
 class MidiOutSession:
