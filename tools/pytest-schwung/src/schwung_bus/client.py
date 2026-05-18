@@ -523,11 +523,16 @@ class SchwungBus:
                 f"(restart-move.sh may not have fired; last counter={prev})"
             )
 
-        # Phase 2: thaw detection.
+        # Phase 2: thaw detection. Use masked delta so a 32-bit wrap
+        # during the restart window (Move runs continuously; ~14 day
+        # uptime hits 0xFFFFFFFF) doesn't make `cur > frozen` falsely
+        # stay False forever. The delta is the forward distance modulo
+        # 2^32, so any nonzero positive advance is a thaw — regardless
+        # of whether the absolute counter wrapped or not.
         while time.monotonic() < deadline:
             try:
                 cur = self.state().shim_counter
-                if cur > frozen_at_value:
+                if ((cur - frozen_at_value) & 0xFFFFFFFF) > 0:
                     return cur
             except SchwungBusError:
                 pass
