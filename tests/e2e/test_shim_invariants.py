@@ -151,6 +151,34 @@ def test_all_notes_off_does_not_change_slot(bus, commander):
 # Track-CC mirror — idempotence and ordering
 # ---------------------------------------------------------------------------
 
+def test_idle_does_not_drift_slot_or_ui_slot(bus, commander):
+    """Selected_slot and ui_slot must not change on their own. Take a
+    snapshot, wait ~290 ms (100 SPI frames), snapshot again — both
+    should be unchanged, and equal to each other.
+
+    Catches a regression where some background tick path (display
+    refresh, sampler tick, MIDI clock handler) writes to either slot
+    field as a side effect. Per-track tests miss this because they
+    actively press something between snapshots.
+    """
+    commander.do(SelectTrack(2, restore_to=1))
+    bus.wait_frame(4)
+    s_before = bus.state()
+    assert s_before.selected_slot == 1 and s_before.ui_slot == 1, "test setup failed"
+
+    bus.wait_frame(100)  # ~290 ms of "no input"
+
+    s_after = bus.state()
+    assert s_after.selected_slot == s_before.selected_slot, (
+        f"selected_slot drifted with no input: "
+        f"{s_before.selected_slot} → {s_after.selected_slot}"
+    )
+    assert s_after.ui_slot == s_before.ui_slot, (
+        f"ui_slot drifted with no input: "
+        f"{s_before.ui_slot} → {s_after.ui_slot}"
+    )
+
+
 def test_repeated_same_track_press_is_idempotent(bus, commander):
     """Pressing the same track button twice should not change the
     slot (it's already selected). Catches a regression where the
