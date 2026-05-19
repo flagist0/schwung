@@ -1677,8 +1677,34 @@ int shadow_param_publish_response(uint32_t req_id) {
         host.on_param_changed(param->slot, param->key, param->value);
     }
 
+    /* Memory ordering: callers (shim_handle_param_special, chain DSP
+     * set_param dispatch above, master_fx set/get, etc.) have already
+     * written `param->value`, `param->error`, `param->result_len`
+     * with plain stores. Readers (shadow_ui's shadow_param_wait_response
+     * and schwung-testd's testd_param_wait_response) acquire-load
+     * `response_ready` and then read those fields.
+     *
+     * For the reader's acquire-load to actually order subsequent
+     * field reads after the writer's earlier field writes, this
+     * publisher MUST release-store `response_ready`. Plain
+     * `param->response_ready = 1` is a volatile store (the field is
+     * declared volatile in shadow_param_t) which the compiler won't
+     * reorder, BUT the ARM A55 CPU (weakly-ordered) is free to
+     * commit it ahead of the value/error writes that preceded it.
+     *
+     * Symptom of getting this wrong: the daemon's GET_PARAM returns
+     * "" right after a SET_PARAM completed successfully, because
+     * its acquire-load on response_ready saw the new 1 while the
+     * peer's plain writes to value were still in the store buffer.
+     * Client-side retry-on-empty masked this in tests but the
+     * window was real.
+     *
+     * Write response_id BEFORE the release-store so the reader sees
+     * the matching id once response_ready=1 is observed. Then clear
+     * request_type AFTER the release-store — it's the next-request
+     * gate, no ordering requirement vs response_ready. */
     param->response_id = req_id;
-    param->response_ready = 1;
+    __atomic_store_n(&param->response_ready, 1, __ATOMIC_RELEASE);
     param->request_type = 0;
     return 1;
 }
