@@ -537,6 +537,64 @@ class SchwungBus:
 
     # ----- param get/set (routes through /schwung-param) -------------------
 
+    # Number of automatic retries on transient param-SHM contention
+    # errors ("param SHM busy", "param SET timeout", "param GET timeout").
+    # The /schwung-param SHM has two producers — shadow_ui and the
+    # daemon — and the wait_idle handshake can briefly fail when
+    # shadow_ui is mid-call (e.g. processing user input on its tick).
+    # 3 retries with 100ms backoff covers ~99% of intermittent races
+    # without masking real failures (a peer that's actually down
+    # times out forever, not intermittently).
+    PARAM_RETRY_COUNT = 3
+    PARAM_RETRY_DELAY_S = 0.1
+
+    _PARAM_TRANSIENT_ERRORS = (
+        "param SHM busy",
+        "param SET timeout",
+        "param GET timeout",
+        "DUMP_PARAM_FILE: GET timeout",
+    )
+
+    def _param_request_with_retry(self, line: str,
+                                   retry_empty: bool = False) -> str:
+        """_request wrapper that retries on transient param SHM errors.
+
+        Non-transient errors (bad key, file not found, ...) pass
+        through immediately.
+
+        ``retry_empty`` (default False): when True, an empty OK
+        response also triggers a retry. This is a workaround for a
+        memory-ordering race in the schwung host's
+        shadow_param_publish_response — it writes
+        response_ready=1 without a release-store, so a fast reader
+        on the daemon can observe response_ready=1 while the peer's
+        prior plain writes to `value` are still in flight. The
+        observable symptom is GET returning "" right after a
+        successful SET, then returning the correct value when
+        retried 100 ms later.
+
+        Callers that expect a numeric value (get_param for
+        scalars) should pass retry_empty=True. Callers that
+        legitimately expect "" (e.g. probing an absent pattern)
+        should pass retry_empty=False (the default).
+        """
+        for attempt in range(self.PARAM_RETRY_COUNT + 1):
+            try:
+                result = self._request(line)
+                if retry_empty and result == "" and attempt < self.PARAM_RETRY_COUNT:
+                    time.sleep(self.PARAM_RETRY_DELAY_S)
+                    continue
+                return result
+            except SchwungBusError as e:
+                msg = str(e)
+                if any(t in msg for t in self._PARAM_TRANSIENT_ERRORS) and \
+                        attempt < self.PARAM_RETRY_COUNT:
+                    time.sleep(self.PARAM_RETRY_DELAY_S)
+                    continue
+                raise
+        # Unreachable — loop exits via return or re-raise. Keep mypy happy.
+        raise SchwungBusError(f"param request exhausted retries: {line!r}")
+
     def set_param(self, key: str, value: str, overtake: bool = True) -> None:
         """SET a chain / overtake-module param via the daemon.
 
@@ -569,7 +627,7 @@ class SchwungBus:
         full_key = f"overtake_dsp:{key}" if overtake else key
         if " " in full_key:
             raise ValueError(f"param key may not contain spaces: {full_key!r}")
-        self._request(f"SET_PARAM {full_key} {value}")
+        self._param_request_with_retry(f"SET_PARAM {full_key} {value}")
 
     def get_param(self, key: str, overtake: bool = True) -> str:
         """GET a chain / overtake-module param via the daemon.
@@ -587,7 +645,35 @@ class SchwungBus:
         full_key = f"overtake_dsp:{key}" if overtake else key
         if " " in full_key:
             raise ValueError(f"param key may not contain spaces: {full_key!r}")
-        return self._request(f"GET_PARAM {full_key}")
+        return self._param_request_with_retry(f"GET_PARAM {full_key}")
+
+    def get_param_int(self, key: str, overtake: bool = True) -> int:
+        """``get_param`` + ``int(...)``, with retry on empty
+        responses. Use when you know the value is numeric — empty
+        string from get_param could legitimately mean "absent" OR
+        could be a memory-ordering race in the host's response
+        publisher (see ``_param_request_with_retry`` for details).
+        Numeric callers don't want either possibility silently.
+        """
+        full_key = f"overtake_dsp:{key}" if overtake else key
+        if " " in full_key:
+            raise ValueError(f"param key may not contain spaces: {full_key!r}")
+        raw = self._param_request_with_retry(
+            f"GET_PARAM {full_key}", retry_empty=True
+        )
+        if raw == "":
+            raise SchwungBusError(
+                f"get_param_int({key!r}): empty response after retries — "
+                "either param key is invalid or the host's response "
+                "publisher isn't propagating writes. Use get_param() "
+                "if empty is a legitimate value."
+            )
+        try:
+            return int(raw)
+        except ValueError as e:
+            raise SchwungBusError(
+                f"get_param_int({key!r}): non-integer response {raw!r}"
+            ) from e
 
     def set_param_from_file(self, key: str, move_path: str,
                             overtake: bool = True) -> None:
@@ -607,7 +693,7 @@ class SchwungBus:
         import re
         if re.search(r'\s', full_key) or re.search(r'\s', move_path):
             raise ValueError("param key / path may not contain whitespace")
-        self._request(f"SET_PARAM_FILE {full_key} {move_path}")
+        self._param_request_with_retry(f"SET_PARAM_FILE {full_key} {move_path}")
 
     def dump_param_to_file(self, key: str, move_path: str,
                            overtake: bool = True) -> int:
@@ -626,7 +712,7 @@ class SchwungBus:
         if re.search(r'\s', full_key) or re.search(r'\s', move_path):
             raise ValueError("param key / path may not contain whitespace")
         # Reply format: "OK bytes=<N>"
-        resp = self._request(f"DUMP_PARAM_FILE {full_key} {move_path}")
+        resp = self._param_request_with_retry(f"DUMP_PARAM_FILE {full_key} {move_path}")
         for tok in resp.split():
             if tok.startswith("bytes="):
                 try:
