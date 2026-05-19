@@ -24,6 +24,7 @@ typedef struct daemon_shm {
     shadow_midi_inject_t    *inject;        /* RW: producers' inject ring */
     shadow_overlay_state_t  *overlay;       /* RO: pad_led_colors snapshot */
     test_stream_shm_t       *midi_out_stream; /* RW: stream of MIDI_OUT events from shim */
+    shadow_param_t          *param;         /* RW: get/set requests to chain DSPs / overtake modules */
 } daemon_shm_t;
 
 /* Wire SHM pointers into the command layer. Must be called before

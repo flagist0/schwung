@@ -17,7 +17,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TESTD_LINE_MAX 256
+/* Line buffer size. 4 KiB chosen to absorb moderate-size SET_PARAM values
+ * (some chain params carry stringified enum lists / colon-separated tuples
+ * up to a few hundred bytes; 256 was tight). Large blobs like project.json
+ * (~5-50 KB) don't go through the line protocol — they use the *_FILE
+ * variants which take a Move-side file path and let the daemon do the
+ * read/write itself. Bumping to 4 KiB costs one heap-allocated buffer
+ * per accepted connection (serve_client puts the array on the stack;
+ * stack default 8 MiB so 4 KiB is fine). */
+#define TESTD_LINE_MAX 4096
 
 /* ---- transport (line I/O) ---------------------------------------------- */
 

@@ -104,6 +104,13 @@ static int wire_shm(daemon_shm_t *out) {
      * shim writes the buffer. */
     if (map_shm_rw(SHM_TEST_STREAM_MIDI_OUT, sizeof(test_stream_shm_t),
                    (void **)&out->midi_out_stream) < 0) return -1;
+    /* Param SHM: daemon is a *second* producer here (shadow_ui already is),
+     * routing SET_PARAM / GET_PARAM tests into chain DSPs and overtake
+     * modules. The wait_idle protocol in shadow_param_wait_idle()
+     * serializes the two producers — see SET_PARAM handler in commands.c
+     * for the rationale + race window. */
+    if (map_shm_rw(SHM_SHADOW_PARAM, sizeof(shadow_param_t),
+                   (void **)&out->param) < 0) return -1;
     return 0;
 }
 

@@ -535,6 +535,106 @@ class SchwungBus:
             raise ValueError(f"module_id too long ({len(module_id)} > 64)")
         self._request(f"SET_OPEN_TOOL {module_id}")
 
+    # ----- param get/set (routes through /schwung-param) -------------------
+
+    def set_param(self, key: str, value: str, overtake: bool = True) -> None:
+        """SET a chain / overtake-module param via the daemon.
+
+        ``key`` is the param key as the module sees it. For overtake
+        modules (ion / m8 / controller etc.) the shim's setupModuleParamShims
+        prepends ``overtake_dsp:`` — when ``overtake=True`` (the default)
+        this wrapper does the same so test code can just call
+        ``bus.set_param("track.0.channel", "5")`` and have it land on
+        ion's set_param("track.0.channel", "5") handler.
+
+        For master-FX / jack / passthrough / chain-slot keys (which
+        already have their own prefix), pass ``overtake=False`` to skip
+        the auto-prefix.
+
+        Wire-format constraint: value must fit in TESTD_LINE_MAX (4 KiB)
+        AFTER prepending "OK " and adding the newline. For larger
+        values (e.g. project.json), use :meth:`set_param_file` which
+        reads a Move-side file. The daemon rejects oversized values
+        with an ERR reply.
+
+        Value must not contain newlines or NUL bytes — the line-based
+        protocol can't represent them. Validate client-side to fail
+        fast with a clear Python exception.
+        """
+        if "\n" in value or "\r" in value or "\0" in value:
+            raise ValueError(
+                "set_param value may not contain newlines or NUL; "
+                "use set_param_file for multi-line payloads"
+            )
+        full_key = f"overtake_dsp:{key}" if overtake else key
+        if " " in full_key:
+            raise ValueError(f"param key may not contain spaces: {full_key!r}")
+        self._request(f"SET_PARAM {full_key} {value}")
+
+    def get_param(self, key: str, overtake: bool = True) -> str:
+        """GET a chain / overtake-module param via the daemon.
+
+        Mirror of :meth:`set_param` on the read side. Same prefixing
+        rules. Returns the param's current value as a string (caller
+        parses to int/float/JSON as appropriate).
+
+        Wire-format constraint: response must fit in TESTD_LINE_MAX.
+        For ``project.json`` and other large GETs, use
+        :meth:`dump_param_to_file` + an SCP round-trip.
+
+        Raises :class:`SchwungBusError` on timeout or peer error.
+        """
+        full_key = f"overtake_dsp:{key}" if overtake else key
+        if " " in full_key:
+            raise ValueError(f"param key may not contain spaces: {full_key!r}")
+        return self._request(f"GET_PARAM {full_key}")
+
+    def set_param_from_file(self, key: str, move_path: str,
+                            overtake: bool = True) -> None:
+        """SET a param from a file already present on Move's filesystem.
+
+        For large JSON payloads (project.json ~5-50 KB) that exceed
+        TESTD_LINE_MAX. Caller must SCP the file to Move first — this
+        method only tells the daemon to read+SET.
+
+        Typical use through the higher-level :meth:`load_ion_project_json`
+        helper which handles the SCP itself.
+        """
+        full_key = f"overtake_dsp:{key}" if overtake else key
+        # Reject any whitespace, not just space — the daemon's args
+        # parser only splits on space, so a tab in path would be
+        # treated as part of the key, producing misleading errors.
+        import re
+        if re.search(r'\s', full_key) or re.search(r'\s', move_path):
+            raise ValueError("param key / path may not contain whitespace")
+        self._request(f"SET_PARAM_FILE {full_key} {move_path}")
+
+    def dump_param_to_file(self, key: str, move_path: str,
+                           overtake: bool = True) -> int:
+        """GET a param, write its value to a Move-side file. Returns
+        the byte count written.
+
+        Mirror of :meth:`set_param_from_file` on the read side. Useful
+        for dumping in-memory state (``project.json``) to inspect via
+        :meth:`load_ion_project_json` -- which uses this internally.
+        """
+        full_key = f"overtake_dsp:{key}" if overtake else key
+        # Reject any whitespace, not just space — the daemon's args
+        # parser only splits on space, so a tab in path would be
+        # treated as part of the key, producing misleading errors.
+        import re
+        if re.search(r'\s', full_key) or re.search(r'\s', move_path):
+            raise ValueError("param key / path may not contain whitespace")
+        # Reply format: "OK bytes=<N>"
+        resp = self._request(f"DUMP_PARAM_FILE {full_key} {move_path}")
+        for tok in resp.split():
+            if tok.startswith("bytes="):
+                try:
+                    return int(tok[6:])
+                except ValueError:
+                    pass
+        raise SchwungBusError(f"DUMP_PARAM_FILE: bad response {resp!r}")
+
     def wait_for_shim_ready(
         self,
         timeout: float = 15.0,

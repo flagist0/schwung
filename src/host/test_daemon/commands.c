@@ -417,6 +417,364 @@ static int cmd_set_open_tool(int fd, const char *args) {
     return protocol_reply(fd, "OK");
 }
 
+/* ============================================================================
+ * PARAM commands — SET_PARAM / GET_PARAM / *_FILE variants
+ *
+ * Route get/set requests into chain DSPs and the active overtake module
+ * via the same /schwung-param SHM that shadow_ui uses. This is what
+ * unlocks ion (and other overtake modules) E2E tests that need to:
+ *   - bootstrap state beyond what input gestures can reach reasonably
+ *     (load a fixture project, set rng.seed for deterministic RNG)
+ *   - verify in-memory params not visible via LED / MIDI snapshots
+ *     (per-step probability after a knob P-lock, track destination
+ *     before pressing pads, etc.)
+ *
+ * Wire protocol:
+ *   SET_PARAM <key> <value>            -> OK    (small scalar values)
+ *   GET_PARAM <key>                    -> OK <value>
+ *   SET_PARAM_FILE <key> <move_path>   -> OK    (load value from a
+ *                                                 Move-side file —
+ *                                                 use for >2 KiB JSON)
+ *   DUMP_PARAM_FILE <key> <move_path>  -> OK    (write GET result to
+ *                                                 a Move-side file —
+ *                                                 test SCPs it back)
+ *
+ * Slot: hardcoded to 0 (the active overtake-module slot OR the
+ * first chain slot when no overtake is loaded). All ion tests run
+ * in overtake_mode == 2 with slot 0. Multi-slot routing is out of
+ * scope for the test bus today (tests can switch which slot is
+ * "focused" via the existing schwung mechanisms if needed).
+ *
+ * Key prefixing: caller-supplied keys are sent verbatim. ion's
+ * params live under the "overtake_dsp:" prefix when ion is the
+ * active overtake module — the Python client prepends this for
+ * overtake-targeted calls. master_fx, jack:, chain-slot keys go
+ * through with their own prefixes unchanged.
+ *
+ * Race window with shadow_ui: shadow_ui is the other producer on
+ * this SHM. The wait_idle protocol (busy-wait until
+ * request_type == 0) serializes both producers — the larger of
+ * the two timeouts wins. Tests run with shadow_ui mostly idle
+ * (no human interaction), so contention is rare. If a test hits
+ * this race and gets TIMEOUT, the daemon returns ERR and the
+ * test should retry — see `bus.set_param()` Python helper. */
+
+#define TESTD_PARAM_POLL_USEC      200
+/* Generous timeout: shadow_ui's own default is 100 ms, but it's
+ * tuned for small scalar params from JS. The test bus also routes
+ * `project.json` GETs (5-50 KB of serialized state) which need
+ * full ion DSP serialization on the audio thread — measured up to
+ * ~2 s on a busy Move. 5 s gives us 2× safety margin.
+ *
+ * The bound is per-request, so a fast SET doesn't pay the cost of
+ * a slow project.json's worst case. */
+#define TESTD_PARAM_TIMEOUT_MS     5000
+
+/* shadow_param request-id sequence. Single-producer relative to the
+ * daemon (one client at a time per Phase 1 contract), so no atomics
+ * needed. Starts at 1 — 0 is the "no response yet" sentinel that
+ * shadow_param->response_id uses. */
+static uint32_t g_testd_param_seq = 0;
+
+static uint32_t testd_param_next_request_id(void) {
+    g_testd_param_seq++;
+    if (g_testd_param_seq == 0) g_testd_param_seq = 1;
+    return g_testd_param_seq;
+}
+
+/* Busy-wait until shadow_param->request_type clears (peer drained the
+ * previous request). Returns 1 on success, 0 on timeout.
+ *
+ * Acquire-load on request_type: pairs with the peer's release-store
+ * when it clears the slot after processing. Without this, the ARM
+ * A55 (weakly-ordered model) can reorder reads of key/value/error
+ * before observing request_type==0, producing a spurious match
+ * against a half-written response. plain `volatile` (which the
+ * shadow_param_t fields carry) prevents compiler reordering but
+ * NOT CPU reordering — atomic_load_acquire covers both. */
+static int testd_param_wait_idle(int timeout_ms) {
+    int polls = (timeout_ms * 1000) / TESTD_PARAM_POLL_USEC;
+    if (polls < 1) polls = 1;
+    while (__atomic_load_n(&g_shm.param->request_type, __ATOMIC_ACQUIRE) != 0
+           && polls > 0) {
+        usleep(TESTD_PARAM_POLL_USEC);
+        polls--;
+    }
+    return __atomic_load_n(&g_shm.param->request_type, __ATOMIC_ACQUIRE) == 0;
+}
+
+/* Wait for shadow_param->response_ready with matching response_id.
+ * Returns:  1 = success,  -1 = peer set error flag,  0 = timeout.
+ *
+ * Same acquire ordering rationale as wait_idle: load response_ready
+ * with acquire so we see the peer's release-store ordering on the
+ * other response fields (response_id, error, value) before deciding
+ * the response is complete. */
+static int testd_param_wait_response(uint32_t req_id, int timeout_ms) {
+    int polls = (timeout_ms * 1000) / TESTD_PARAM_POLL_USEC;
+    if (polls < 1) polls = 1;
+    while (polls > 0) {
+        if (__atomic_load_n(&g_shm.param->response_ready, __ATOMIC_ACQUIRE)) {
+            /* Acquire above orders the subsequent plain reads below. */
+            if (g_shm.param->response_id == req_id) {
+                return g_shm.param->error ? -1 : 1;
+            }
+        }
+        usleep(TESTD_PARAM_POLL_USEC);
+        polls--;
+    }
+    return 0;
+}
+
+/* Shared SET helper: copy key+value into SHM, fire request_type=1,
+ * wait for response. value_len < SHADOW_PARAM_VALUE_LEN required;
+ * caller pre-validates. */
+static int testd_param_do_set(int fd, const char *key, const char *value, size_t value_len) {
+    if (!g_shm.param) {
+        return protocol_reply_err(fd, "param SHM not mapped");
+    }
+    if (strlen(key) >= SHADOW_PARAM_KEY_LEN) {
+        return protocol_reply_err(fd, "key too long");
+    }
+    if (value_len >= SHADOW_PARAM_VALUE_LEN) {
+        return protocol_reply_err(fd, "value too long for param SHM");
+    }
+
+    if (!testd_param_wait_idle(TESTD_PARAM_TIMEOUT_MS)) {
+        return protocol_reply_err(fd, "param SHM busy (shadow_ui not draining)");
+    }
+
+    uint32_t req_id = testd_param_next_request_id();
+    strncpy(g_shm.param->key, key, SHADOW_PARAM_KEY_LEN - 1);
+    g_shm.param->key[SHADOW_PARAM_KEY_LEN - 1] = '\0';
+    /* Use memcpy (not strncpy) because value may contain embedded NULs
+     * for binary payloads. SET_PARAM_FILE reads raw file contents. */
+    memcpy(g_shm.param->value, value, value_len);
+    if (value_len < SHADOW_PARAM_VALUE_LEN) {
+        g_shm.param->value[value_len] = '\0';
+    }
+    g_shm.param->slot = 0;
+    g_shm.param->response_ready = 0;
+    g_shm.param->error = 0;
+    g_shm.param->response_id = 0;
+    g_shm.param->request_id = req_id;
+    /* Release-fence: ensure key/value/slot writes are visible before
+     * the peer sees request_type != 0. */
+    __atomic_store_n(&g_shm.param->request_type, 1, __ATOMIC_RELEASE);
+
+    int rc = testd_param_wait_response(req_id, TESTD_PARAM_TIMEOUT_MS);
+    if (rc == 0) return protocol_reply_err(fd, "param SET timeout");
+    if (rc < 0) return protocol_reply_err(fd, "param SET error from peer");
+    return protocol_reply(fd, "OK");
+}
+
+static int cmd_set_param(int fd, const char *args) {
+    if (!args || !*args) {
+        return protocol_reply_err(fd, "SET_PARAM expects <key> <value>");
+    }
+    /* Split on first whitespace: key + value. Value may contain spaces
+     * (some chain params accept comma+space-separated lists). */
+    const char *sep = strchr(args, ' ');
+    if (!sep) {
+        return protocol_reply_err(fd, "SET_PARAM: missing value after key");
+    }
+    size_t key_len = sep - args;
+    if (key_len == 0) {
+        return protocol_reply_err(fd, "SET_PARAM: empty key");
+    }
+    if (key_len >= SHADOW_PARAM_KEY_LEN) {
+        return protocol_reply_err(fd, "SET_PARAM: key too long");
+    }
+    /* Reject '=' in key: shim's prefix-based routing (overtake_dsp:,
+     * jack:, master_fx:, etc) does literal string comparisons. A
+     * `key=foo` would silently miss every prefix and fall through to
+     * a no-op set that still returns success — exactly the kind of
+     * silent-wrong behavior tests need to catch loudly. */
+    if (memchr(args, '=', key_len) != NULL) {
+        return protocol_reply_err(fd, "SET_PARAM: key may not contain '='");
+    }
+    char key[SHADOW_PARAM_KEY_LEN];
+    memcpy(key, args, key_len);
+    key[key_len] = '\0';
+    const char *value = sep + 1;
+    return testd_param_do_set(fd, key, value, strlen(value));
+}
+
+static int cmd_get_param(int fd, const char *args) {
+    if (!args || !*args) {
+        return protocol_reply_err(fd, "GET_PARAM expects <key>");
+    }
+    /* No spaces allowed in keys; whole `args` is the key. */
+    if (strchr(args, ' ') != NULL) {
+        return protocol_reply_err(fd, "GET_PARAM: key may not contain spaces");
+    }
+    if (strlen(args) >= SHADOW_PARAM_KEY_LEN) {
+        return protocol_reply_err(fd, "GET_PARAM: key too long");
+    }
+    if (!g_shm.param) {
+        return protocol_reply_err(fd, "param SHM not mapped");
+    }
+
+    if (!testd_param_wait_idle(TESTD_PARAM_TIMEOUT_MS)) {
+        return protocol_reply_err(fd, "param SHM busy");
+    }
+
+    uint32_t req_id = testd_param_next_request_id();
+    strncpy(g_shm.param->key, args, SHADOW_PARAM_KEY_LEN - 1);
+    g_shm.param->key[SHADOW_PARAM_KEY_LEN - 1] = '\0';
+    /* Clear value to avoid stale data appearing in the response. */
+    memset(g_shm.param->value, 0, SHADOW_PARAM_VALUE_LEN);
+    g_shm.param->slot = 0;
+    g_shm.param->response_ready = 0;
+    g_shm.param->error = 0;
+    g_shm.param->response_id = 0;
+    g_shm.param->request_id = req_id;
+    __atomic_store_n(&g_shm.param->request_type, 2, __ATOMIC_RELEASE);
+
+    int rc = testd_param_wait_response(req_id, TESTD_PARAM_TIMEOUT_MS);
+    if (rc == 0) return protocol_reply_err(fd, "param GET timeout");
+    if (rc < 0) return protocol_reply_err(fd, "param GET error from peer");
+
+    /* Response value must fit on the line. The cap is TESTD_LINE_MAX
+     * (4 KiB). The snprintf below writes "OK %s" (3 bytes prefix +
+     * value + NUL) into `line[TESTD_LINE_MAX]`; protocol_reply adds
+     * `\n` in its own buffer. We need vlen + 3 + NUL ≤ TESTD_LINE_MAX,
+     * i.e. vlen + 4 ≤ TESTD_LINE_MAX, i.e. vlen < TESTD_LINE_MAX - 3.
+     * Large blobs like project.json (5-50 KB) overflow this and must
+     * use DUMP_PARAM_FILE instead. */
+    size_t vlen = strnlen(g_shm.param->value, SHADOW_PARAM_VALUE_LEN);
+    if (vlen + 3 >= TESTD_LINE_MAX) {
+        return protocol_reply_err(fd,
+            "GET_PARAM: value too large for line protocol (use DUMP_PARAM_FILE)");
+    }
+    char line[TESTD_LINE_MAX];
+    snprintf(line, sizeof(line), "OK %s", g_shm.param->value);
+    return protocol_reply(fd, line);
+}
+
+/* SET_PARAM_FILE <key> <move_path>: read <move_path> from Move's
+ * filesystem, set <key> = file contents. Used for large JSON
+ * payloads (project.json ~5-50 KB) that don't fit in TESTD_LINE_MAX.
+ * Caller (test side) must SCP the file to Move first. */
+static int cmd_set_param_file(int fd, const char *args) {
+    if (!args || !*args) {
+        return protocol_reply_err(fd, "SET_PARAM_FILE expects <key> <path>");
+    }
+    const char *sep = strchr(args, ' ');
+    if (!sep) {
+        return protocol_reply_err(fd, "SET_PARAM_FILE: missing path after key");
+    }
+    size_t key_len = sep - args;
+    if (key_len == 0 || key_len >= SHADOW_PARAM_KEY_LEN) {
+        return protocol_reply_err(fd, "SET_PARAM_FILE: bad key length");
+    }
+    char key[SHADOW_PARAM_KEY_LEN];
+    memcpy(key, args, key_len);
+    key[key_len] = '\0';
+    const char *path = sep + 1;
+
+    /* Read the file. Caller-side path; daemon trusts the test runner
+     * not to point at /etc/shadow. Production-deploy gate (no setuid,
+     * loopback only) bounds the threat. */
+    int rfd = open(path, O_RDONLY);
+    if (rfd < 0) {
+        return protocol_reply_err(fd, "SET_PARAM_FILE: cannot open file");
+    }
+    struct stat st;
+    if (fstat(rfd, &st) < 0) {
+        close(rfd);
+        return protocol_reply_err(fd, "SET_PARAM_FILE: stat failed");
+    }
+    /* Reject non-regular files. A symlink to a FIFO / socket / device
+     * passes open() + fstat() with a plausible st_size, then read()
+     * blocks indefinitely — hanging the daemon for TESTD_PARAM_TIMEOUT_MS
+     * (or longer if the FIFO never has data). */
+    if (!S_ISREG(st.st_mode)) {
+        close(rfd);
+        return protocol_reply_err(fd, "SET_PARAM_FILE: not a regular file");
+    }
+    /* Cast through signed off_t check first — `(size_t)(-1)` is SIZE_MAX
+     * which falsely satisfies a naked `>= SHADOW_PARAM_VALUE_LEN` check
+     * for filesystems that report negative sizes under error conditions. */
+    if (st.st_size < 0 || (size_t)st.st_size >= SHADOW_PARAM_VALUE_LEN) {
+        close(rfd);
+        return protocol_reply_err(fd, "SET_PARAM_FILE: file too large or invalid size");
+    }
+    /* Read into a stack buffer (>= 64 KiB so stack growth from
+     * default 8 MiB is still safe). Avoids heap alloc on hot path. */
+    static char file_buf[SHADOW_PARAM_VALUE_LEN];
+    ssize_t n = read(rfd, file_buf, st.st_size);
+    close(rfd);
+    if (n != st.st_size) {
+        return protocol_reply_err(fd, "SET_PARAM_FILE: short read");
+    }
+    return testd_param_do_set(fd, key, file_buf, (size_t)n);
+}
+
+/* DUMP_PARAM_FILE <key> <move_path>: GET <key>, write response value
+ * to <move_path>. Used for large GET payloads (project.json export)
+ * that don't fit in the line protocol. Test reads <move_path> back
+ * via SCP. */
+static int cmd_dump_param_file(int fd, const char *args) {
+    if (!args || !*args) {
+        return protocol_reply_err(fd, "DUMP_PARAM_FILE expects <key> <path>");
+    }
+    const char *sep = strchr(args, ' ');
+    if (!sep) {
+        return protocol_reply_err(fd, "DUMP_PARAM_FILE: missing path after key");
+    }
+    size_t key_len = sep - args;
+    if (key_len == 0 || key_len >= SHADOW_PARAM_KEY_LEN) {
+        return protocol_reply_err(fd, "DUMP_PARAM_FILE: bad key length");
+    }
+    char key[SHADOW_PARAM_KEY_LEN];
+    memcpy(key, args, key_len);
+    key[key_len] = '\0';
+    const char *path = sep + 1;
+    if (!g_shm.param) {
+        return protocol_reply_err(fd, "param SHM not mapped");
+    }
+
+    if (!testd_param_wait_idle(TESTD_PARAM_TIMEOUT_MS)) {
+        return protocol_reply_err(fd, "param SHM busy");
+    }
+    uint32_t req_id = testd_param_next_request_id();
+    strncpy(g_shm.param->key, key, SHADOW_PARAM_KEY_LEN - 1);
+    g_shm.param->key[SHADOW_PARAM_KEY_LEN - 1] = '\0';
+    memset(g_shm.param->value, 0, SHADOW_PARAM_VALUE_LEN);
+    g_shm.param->slot = 0;
+    g_shm.param->response_ready = 0;
+    g_shm.param->error = 0;
+    g_shm.param->response_id = 0;
+    g_shm.param->request_id = req_id;
+    __atomic_store_n(&g_shm.param->request_type, 2, __ATOMIC_RELEASE);
+
+    int rc = testd_param_wait_response(req_id, TESTD_PARAM_TIMEOUT_MS);
+    if (rc == 0) return protocol_reply_err(fd, "DUMP_PARAM_FILE: GET timeout");
+    if (rc < 0) return protocol_reply_err(fd, "DUMP_PARAM_FILE: peer error");
+
+    size_t vlen = strnlen(g_shm.param->value, SHADOW_PARAM_VALUE_LEN);
+    int wfd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
+                   S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (wfd < 0) {
+        return protocol_reply_err(fd, "DUMP_PARAM_FILE: cannot open file for write");
+    }
+    ssize_t written = write(wfd, g_shm.param->value, vlen);
+    if (written != (ssize_t)vlen) {
+        close(wfd);
+        return protocol_reply_err(fd, "DUMP_PARAM_FILE: short write");
+    }
+    if (fsync(wfd) < 0) {
+        close(wfd);
+        return protocol_reply_err(fd, "DUMP_PARAM_FILE: fsync failed");
+    }
+    close(wfd);
+
+    char line[64];
+    snprintf(line, sizeof(line), "OK bytes=%zu", vlen);
+    return protocol_reply(fd, line);
+}
+
 static int cmd_quit(int fd, const char *args) {
     (void)args;
     /* Symmetric with the post-disconnect cleanup in schwung_testd.c —
@@ -444,6 +802,10 @@ static const command_entry_t g_commands[] = {
     {"STATE",             cmd_state},
     {"RESTART_MOVE",      cmd_restart_move},
     {"SET_OPEN_TOOL",     cmd_set_open_tool},
+    {"SET_PARAM",         cmd_set_param},
+    {"GET_PARAM",         cmd_get_param},
+    {"SET_PARAM_FILE",    cmd_set_param_file},
+    {"DUMP_PARAM_FILE",   cmd_dump_param_file},
     {"SUBSCRIBE",         cmd_subscribe},
     {"UNSUBSCRIBE",       cmd_unsubscribe},
     {"DUMP",              cmd_dump},
