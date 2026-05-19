@@ -15,7 +15,7 @@ The 78% breaks down approximately as:
 
 | Source | % of profile samples (~25% of wall-time of core) | Subsystem |
 |---|---|---|
-| `getxattr` | 12.6% | filesystem walker |
+| `getxattr` | 12.6% | filesystem walker (**EMPIRICALLY 32,200 calls/sec** — see Phase 6.55) |
 | `fstatat`  | 5.5%  | filesystem walker |
 | `open` + `close` | 5.3% | filesystem walker |
 | `getdents64` | 2.8% | filesystem walker |
@@ -299,6 +299,74 @@ the same code paths that already call `setxattr`** (they own all the
 write sites). Or wire `inotify` on `/data/UserData/UserLibrary/Sets/`.
 Either drops the cost to near-zero.
 
+### Phase 6.55: EMPIRICAL call-rate measurement via xattr_counter (passive LD_PRELOAD)
+
+To verify subagent #3's hypothesis directly, added `src/host/xattr_counter.c` —
+a passive LD_PRELOAD interposer that wraps `getxattr`/`setxattr` (and the
+`l*` variants), increments per-key atomic counters, and logs the
+per-second delta from a background pthread. Gated by
+`/data/UserData/schwung/xattr_count_on` flag file. **Always defers to
+the real syscall — does NOT change behavior, just measures.**
+
+**The measurement (Move idle, no ion loaded, no user interaction,
+14 sets in UserLibrary, ~30 seconds of steady-state):**
+
+```
+20:02:36.698 xattr 1s: get=32200 set=0  [last-modified-time=g6440/s0 local-cloud-state=g6440/s0
+                                          song-color=g6440/s0 song-index=g6440/s0
+                                          was-externally-modified=g6440/s0 ]
+20:02:37.699 xattr 1s: get=32200 ...same pattern...
+20:02:38.699 xattr 1s: get=32122 ...
+20:02:39.699 xattr 1s: get=32149 ...
+20:02:40.699 xattr 1s: get=32189 ...
+20:02:41.699 xattr 1s: get=32060 ...
+```
+
+**32,200 getxattr calls per second**, distributed evenly across the
+5 song-state keys (~6,440 each), with `setxattr` count permanently 0.
+
+Implications:
+- 32200 / 14 sets / 5 keys = **460 full walks of the SongList per second**
+- Each call costs ~3 μs (likely VFS-cached so kernel side is cheap),
+  so 32200 × 3 μs = ~97 ms CPU/sec = ~10% wall-time on one core
+- This matches the sampling profiler's ~12.6% getxattr fraction
+  closely — the sampler was correct on CPU time, but vastly
+  **underestimated** call rate because each call is sub-millisecond
+  and rarely caught by the 1 kHz sampler
+- 460 Hz doesn't match audio block rate (344 Hz). It's plausibly
+  the rate at which Browser model dirty-checks happen, likely
+  driven by multiple callers each rebuilding once per UI tick
+- **Scaling implication for users with many sets**: 80 sets at this
+  cadence would mean 184,000 getxattr/sec, costing ~550 ms CPU/sec
+  on the same hardware — well over one full core, would absolutely
+  saturate. **Move users with large libraries WILL see this as a
+  performance bug.**
+
+The counter has zero behavior impact (passes through unchanged), so
+it's safe to leave in the shim build behind the flag. Useful as a
+diagnostic on user devices to confirm the issue manifests there too.
+
+**Cross-state comparison (Move IDLE vs ION LOADED):**
+
+A second measurement loaded ion via testd's `set_open_tool("ion")`
+mid-capture to see if entering overtake mode reduces FS-walker
+pressure (since Move's UI is "hidden" under ion):
+
+```
+phase                  | get/sec (median)
+IDLE (no ion)          | 32,200
+TRANSITION (load ion)  | 30,000 (briefly)
+STEADY (ion overtake)  | 29,800 (-7%)
+```
+
+**Move continues walking even when ion has taken over the UI.** The
+Browser model dirty-checking still fires — just slightly less often
+because overtake mode probably suppresses some screen-redraw triggers.
+For our E2E tests this means the FS-walker noise is present in **all**
+test scenarios, not just the brief transition during `set_open_tool`.
+The xattr cache mitigation would benefit tests regardless of which
+fixture/test class is active.
+
 ### Phase 6.6: candidate shim mitigation (sketched, NOT implemented)
 
 **LD_PRELOAD `getxattr` interposer with process-level cache.** The
@@ -435,7 +503,10 @@ above for follow-up.
 Source code:
 - `src/host/sampling_profiler.c` — the in-shim profiler
 - `src/host/sampling_profiler.h` — public API
-- `scripts/build.sh` — extended source list to include profiler
+- `src/host/xattr_counter.c` — passive xattr call-rate counter
+  (flag `xattr_count_on`)
+- `scripts/build.sh` — extended source list to include profiler +
+  counter
 
 Tools:
 - `tools/sampling_profiler/parse_sprof.py` — binary dump → top stacks
