@@ -215,16 +215,45 @@ class SchwungBus:
         """Return the daemon's identity string (e.g. 'schwung-testd 0.1.0')."""
         return self._request("PING")
 
+    # Optional minimum wall-clock spacing between consecutive
+    # inject_midi calls. Set via the SCHWUNG_INJECT_MIN_GAP_S env
+    # var (float seconds), or programmatically by tests that need
+    # to slow down injection. Default 0 = no spacing (matches
+    # legacy behavior).
+    #
+    # Why this exists: rapid back-to-back injects can pile up in
+    # the same shim drain frame (16 packets/frame cap), or land in
+    # the same shadow_ui tick which then sees them in a different
+    # order than they were injected (jog turn accumulator vs jog
+    # click immediate route — see test_menu_navigation.py for the
+    # original symptom). Wall-clock spacing crosses Move's
+    # multi-process boundaries that wait_frame (SPI-counter-based)
+    # doesn't always reach.
+    _inject_min_gap_s: float = float(os.environ.get("SCHWUNG_INJECT_MIN_GAP_S", "0") or 0)
+    _last_inject_at: float = 0.0
+
     def inject_midi(self, packet: bytes) -> None:
         """Inject one 4-byte USB-MIDI packet into Move's MIDI_IN buffer.
 
         Packet format: [CIN+cable, status, data1, data2]. Cable nibble is
         the high nibble of byte 0; CIN the low nibble. Cable 0 = internal
         hardware (pads/buttons), cable 2 = external USB.
+
+        If a minimum inject gap is configured (via the
+        SCHWUNG_INJECT_MIN_GAP_S env var or by setting
+        ``bus._inject_min_gap_s``), this method sleeps as needed
+        before sending so consecutive injects are at least that
+        far apart in wall-clock time.
         """
         if len(packet) != 4:
             raise ValueError(f"INJECT_MIDI expects exactly 4 bytes, got {len(packet)}")
+        if self._inject_min_gap_s > 0:
+            elapsed = time.monotonic() - self._last_inject_at
+            if elapsed < self._inject_min_gap_s:
+                time.sleep(self._inject_min_gap_s - elapsed)
         self._request("INJECT_MIDI " + packet.hex())
+        if self._inject_min_gap_s > 0:
+            self._last_inject_at = time.monotonic()
 
     def wait_frame(self, n: int = 1) -> WaitFrameResult:
         """Block until the shim has ticked at least N more SPI frames."""
