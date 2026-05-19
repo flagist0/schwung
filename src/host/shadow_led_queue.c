@@ -225,10 +225,25 @@ void shadow_clear_move_leds_if_overtake(void) {
     }
 
     /* Scan Move's MIDI_OUT and cache LED state.
-     * When not in overtake, always cache. When in overtake with skip_led_clear,
-     * also cache since Move's LEDs are passing through and we want an up-to-date
-     * snapshot for restore on exit. */
-    if (!cur_overtake || (ctrl && ctrl->skip_led_clear)) {
+     *
+     * Cache unconditionally — the array reflects "what color is currently
+     * on each pad/CC LED", regardless of which side painted it (Move
+     * firmware, overtake module like ion, JACK output, etc.). The
+     * snapshot taken at overtake entry (snapshot_note_color, line below)
+     * uses move_note_led_state's value AT THE MOMENT OF ENTRY, so caching
+     * during overtake doesn't poison the restore snapshot — it only
+     * makes the cache useful for "what's lit right now?" queries from
+     * the test bus (snapshot_pad_leds / snapshot_step_leds) and any
+     * other consumer that wants live state.
+     *
+     * Previously this was gated on `!cur_overtake || skip_led_clear`,
+     * which meant overtake modules' LED writes (ion's pad/step grid,
+     * controller's bank LEDs, etc.) never reached the cache. The
+     * test-bus snapshots returned 0 for any LED an overtake module
+     * was painting — making LED-state assertions impossible for the
+     * exact case where they're most useful (on-device regression
+     * tests for ion / m8 / sidcontrol / controller). */
+    {
         for (int i = 0; i < HW_MIDI_OUT_SIZE; i += 4) {
             uint8_t cable = (midi_out[i] >> 4) & 0x0F;
             uint8_t type = midi_out[i+1] & 0xF0;
@@ -403,6 +418,21 @@ void shadow_flush_pending_leds(void) {
             midi_out[slot+1] = shadow_pending_note_status[i];
             midi_out[slot+2] = (uint8_t)i;
             midi_out[slot+3] = (uint8_t)shadow_pending_note_color[i];
+            /* Mirror this emit into the live LED-state cache used by the
+             * test bus (snapshot_pad_leds / snapshot_step_leds) and any
+             * other "what's lit right now?" reader. Without this, overtake
+             * module LED writes (ion/m8/controller etc.) never reach the
+             * cache: the MIDI_OUT scan in shadow_clear_move_leds_if_overtake
+             * runs at the *start* of post-ioctl, before this flush has
+             * populated the buffer with the current frame's emissions.
+             * Even with cache-unconditionally enabled, the scan would only
+             * see the previous frame's emissions IF the buffer survived
+             * ioctl unchanged — which it doesn't reliably across all SPI
+             * transfer modes. Updating the cache at the exact emit point
+             * removes that uncertainty. */
+            move_note_led_state[i] = (int)(uint8_t)shadow_pending_note_color[i];
+            move_note_led_status[i] = shadow_pending_note_status[i];
+            move_note_led_cin[i] = shadow_pending_note_cin[i];
             shadow_pending_note_color[i] = -1;
             sent++;
         }
@@ -444,6 +474,13 @@ void shadow_flush_pending_leds(void) {
             midi_out[slot+1] = shadow_pending_cc_status[i];
             midi_out[slot+2] = (uint8_t)i;
             midi_out[slot+3] = (uint8_t)shadow_pending_cc_color[i];
+            /* Mirror into live cache — see note above the parallel
+             * note-emit block. Overtake modules also write CC-based LEDs
+             * (e.g. track buttons, knob LEDs), so the cache needs the
+             * same emit-time update for the CC range. */
+            move_cc_led_state[i] = (int)(uint8_t)shadow_pending_cc_color[i];
+            move_cc_led_status[i] = shadow_pending_cc_status[i];
+            move_cc_led_cin[i] = shadow_pending_cc_cin[i];
             shadow_pending_cc_color[i] = -1;
             sent++;
         }
