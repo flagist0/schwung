@@ -40,9 +40,19 @@
    - `/tmp/profile_baseline.bin` — earlier identical-ish profile
    - `/tmp/profile.bin.symbols.txt` — libc symbol table for that
      profile (`<lib> <hex> <sym>` format, auto-found by parser)
-   - `/tmp/profile.folded` — pre-folded for flamegraph.pl
+   - `/tmp/profile.folded`, `/tmp/profile_baseline.folded` — pre-folded
+     for flamegraph.pl
+   - **`/tmp/move_flame.svg`** — interactive flame-graph rendered from
+     `profile_baseline.folded`. Open in any browser. Each box is a
+     stack frame; box width = sample count. The wide bottom band of
+     `getxattr`/`fstatat`/`open`/`close` is the visualization of
+     the 25% FS-walker cost.
+   - `/tmp/flamegraph.pl` — downloaded helper script if you want to
+     regenerate
    - `/tmp/xattr_phases.log` — capture spanning idle → ion-loaded
    - `/tmp/xattr_restart.log` — capture spanning restart_move
+   - `/tmp/xattr_counter_baseline.log` — initial steady-state capture
+     (30 s of ~32,200/sec readings)
 
 ## Executive summary
 
