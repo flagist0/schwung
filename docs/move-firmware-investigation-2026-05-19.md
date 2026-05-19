@@ -367,6 +367,31 @@ test scenarios, not just the brief transition during `set_open_tool`.
 The xattr cache mitigation would benefit tests regardless of which
 fixture/test class is active.
 
+**Restart cycle behavior** (third measurement: 15s idle baseline →
+restart_move via testd → 35s capture):
+
+```
+phase                 | get/sec
+ion still loaded      | 29,800-30,900 (matches phase-2 above)
+RESTART trigger (1s)  | 7,700 (MoveOriginal dying)
+boot ramp (3-4s)      | 25,000-31,000 (variable)
+post-boot idle        | 32,100-32,300 (rock-solid, no ion now)
+```
+
+The walker fires **steadily ~32,200/sec from t≈+5s post-restart**, no
+extra burst from `Loading initial song` or `BNYX Demo 2/Song.abl`
+deserialization (those costs are in different syscalls — `open` /
+`read` on the big project file + samples, not xattr). So xattr-walker
+load is **constant noise, not test-event-correlated**. This implies
+test latency variance is caused by preemption windows / cross-process
+sync chain effects, not directly by walker bursts.
+
+The walker's ~460Hz cadence (32,200/sec ÷ 70 xattr-per-walk) doesn't
+correspond to the audio block rate (344Hz). Plausibly tied to a UI
+dirty-check timer or to multiple callers all rebuilding once per UI
+tick. Could be confirmed by a Ghidra dive into the call sites at the
+addresses subagent #3 listed (`0x009e4d44`, `0x009ef958`, `0x0096c018`).
+
 ### Phase 6.6: candidate shim mitigation (sketched, NOT implemented)
 
 **LD_PRELOAD `getxattr` interposer with process-level cache.** The
