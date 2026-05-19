@@ -647,6 +647,37 @@ class SchwungBus:
             raise ValueError(f"param key may not contain spaces: {full_key!r}")
         return self._param_request_with_retry(f"GET_PARAM {full_key}")
 
+    def set_param_and_verify(self, key: str, value: str,
+                             overtake: bool = True,
+                             timeout_s: float = 2.0) -> None:
+        """SET a param, then poll GET until the value matches (or
+        timeout). Handles the SET-is-async race: ion's DSP set_param
+        runs on the audio thread and may not apply before the daemon's
+        response_ready=1 fires. A tight ``set → get`` loop in a test
+        can read the OLD value because the new write is still queued.
+
+        Use this instead of bare ``bus.set_param(key, value)`` in
+        loops where the next assertion depends on the value being
+        applied. For one-shot SETs, ``set_param`` is fine (settle
+        before next operation).
+        """
+        self.set_param(key, value, overtake=overtake)
+        deadline = time.monotonic() + timeout_s
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                last = self.get_param(key, overtake=overtake)
+                if last == value:
+                    return
+            except SchwungBusError:
+                pass
+            time.sleep(0.03)
+        raise SchwungBusError(
+            f"set_param_and_verify({key!r}, {value!r}): GET still returns "
+            f"{last!r} after {timeout_s}s. SET may not have propagated to "
+            f"the DSP."
+        )
+
     def get_param_int(self, key: str, overtake: bool = True) -> int:
         """``get_param`` + ``int(...)``, with retry on empty
         responses. Use when you know the value is numeric — empty
