@@ -495,6 +495,46 @@ class SchwungBus:
         """
         self._request("RESTART_MOVE")
 
+    def set_open_tool(self, module_id: str) -> None:
+        """Ask shadow_ui to load the tool module with the given id.
+
+        Mirrors what schwung-manager (the web UI on port 7700) does
+        when the user clicks "Open in tool" from the browser. The
+        daemon writes ``/data/UserData/schwung/open_tool_cmd.json``
+        with ``{"tool_id": module_id, "file_path": "__test_bus__"}``
+        (the non-empty placeholder is required — shadow_ui's
+        ``if (cmd.file_path && cmd.tool_id)`` check treats an empty
+        string as falsy and silently skips the load) and raises
+        the ``shadow_control.open_tool_cmd`` SHM flag. shadow_ui's
+        tick polls the flag, reads the JSON, locates the module by
+        id, and calls ``startInteractiveTool`` — putting Move into
+        ``OVERTAKE_MODULE`` (state.overtake_mode == 2).
+
+        Returns as soon as the daemon has written the file and set
+        the flag. The actual module load completes asynchronously
+        (~500 ms-2 s depending on module size). Caller should poll
+        ``state().overtake_mode == 2`` to wait for the load — use
+        the ``ion_loaded`` / module-loaded fixtures rather than
+        calling this directly when you can.
+
+        ``module_id`` must match ``[a-zA-Z0-9_-]+``, max 64 chars
+        — daemon enforces this and rejects anything else.
+
+        Raises :class:`SchwungBusError` on validation failure.
+        """
+        if not module_id:
+            raise ValueError("set_open_tool requires a non-empty module_id")
+        # Brief client-side validation to fail fast with a Python
+        # exception rather than waiting for the daemon's ERR reply.
+        import re
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", module_id):
+            raise ValueError(
+                f"module_id must match [a-zA-Z0-9_-]+, got {module_id!r}"
+            )
+        if len(module_id) > 64:
+            raise ValueError(f"module_id too long ({len(module_id)} > 64)")
+        self._request(f"SET_OPEN_TOOL {module_id}")
+
     def wait_for_shim_ready(
         self,
         timeout: float = 15.0,

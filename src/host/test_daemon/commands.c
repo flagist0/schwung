@@ -15,10 +15,12 @@
 #include "protocol.h"
 #include "shadow_midi_inject_writer.h"
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -314,6 +316,107 @@ static int cmd_restart_move(int fd, const char *args) {
     return protocol_reply(fd, "OK");
 }
 
+/* SET_OPEN_TOOL <module_id> — ask shadow_ui to load the given tool
+ * module (e.g. "ion"). Mirrors what schwung-manager's web UI does
+ * when the user clicks "Open in tool" — two-part message:
+ *
+ *   1. Write JSON payload {"tool_id":"X","file_path":""} to
+ *      /data/UserData/schwung/open_tool_cmd.json
+ *   2. Set shadow_control_t.open_tool_cmd = 1 to nudge shadow_ui
+ *      that a new command is queued.
+ *
+ * shadow_ui's per-tick poll reads the flag (auto-clears in the
+ * accessor), opens the JSON, finds the module by id in its
+ * registry, and invokes startInteractiveTool. The module loads
+ * into overtake mode — observable as state.overtake_mode == 2
+ * within a few seconds.
+ *
+ * Validation: module_id is restricted to [a-zA-Z0-9_-]+, max 64
+ * chars. The JSON we emit is hand-formatted (no escaping needed
+ * given the restricted charset). file_path is empty — tools like
+ * ion that don't open a specific file ignore it; tools that do
+ * (file-browser etc.) wouldn't be useful via this E2E path
+ * without a separate test-side file management strategy.
+ *
+ * Caller should poll state() until overtake_mode reaches 2 (or
+ * timeout) — load can take ~500 ms-2 s depending on module size. */
+#define OPEN_TOOL_CMD_PATH "/data/UserData/schwung/open_tool_cmd.json"
+#define MAX_MODULE_ID_LEN 64
+
+static int cmd_set_open_tool(int fd, const char *args) {
+    if (!args || !*args) {
+        return protocol_reply_err(fd, "SET_OPEN_TOOL needs <module_id>");
+    }
+    /* Length first, then per-char whitelist. (Earlier loop-fused
+     * version had an off-by-one — a 65-char id slipped through
+     * because the length check fired one iteration late.) */
+    size_t len = strlen(args);
+    if (len == 0) {
+        return protocol_reply_err(fd, "SET_OPEN_TOOL: empty module_id");
+    }
+    if (len > MAX_MODULE_ID_LEN) {
+        return protocol_reply_err(fd, "SET_OPEN_TOOL: module_id too long");
+    }
+    /* Strict whitelist on module_id chars to keep JSON well-formed
+     * without an escaping pass, AND to keep the file write safe
+     * (no shell, no path traversal). */
+    for (const char *p = args; *p; p++) {
+        char c = *p;
+        int ok = (c >= 'a' && c <= 'z') ||
+                 (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') ||
+                 c == '_' || c == '-';
+        if (!ok) {
+            return protocol_reply_err(fd, "SET_OPEN_TOOL: module_id must match [a-zA-Z0-9_-]+");
+        }
+    }
+
+    /* 1. Write JSON payload. Create+truncate so a partial old file
+     * doesn't confuse shadow_ui's JSON parse.
+     *
+     * file_path is a non-empty placeholder ("__test_bus__") because
+     * shadow_ui's open_tool_cmd handler checks `if (cmd.file_path &&
+     * cmd.tool_id)` — empty string is falsy and the load is skipped.
+     * Tools that don't need a file (anything with skip_file_browser:
+     * true in tool_config, like ion) ignore the value. */
+    char json[MAX_MODULE_ID_LEN + 128];
+    int n = snprintf(json, sizeof(json),
+                     "{\"tool_id\":\"%s\",\"file_path\":\"__test_bus__\"}", args);
+    if (n < 0 || n >= (int)sizeof(json)) {
+        return protocol_reply_err(fd, "SET_OPEN_TOOL: payload formatting failed");
+    }
+
+    int jfd = open(OPEN_TOOL_CMD_PATH,
+                   O_WRONLY | O_CREAT | O_TRUNC,
+                   S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (jfd < 0) {
+        return protocol_reply_err(fd, "SET_OPEN_TOOL: cannot open JSON file for write");
+    }
+    ssize_t written = write(jfd, json, (size_t)n);
+    if (written != n) {
+        close(jfd);
+        return protocol_reply_err(fd, "SET_OPEN_TOOL: short write to JSON file");
+    }
+    /* fsync before raising the SHM flag — release-store orders only
+     * memory access between CPUs, NOT the VFS page cache. Without
+     * fsync, shadow_ui's host_read_file might race the kernel's
+     * deferred page flush and see an empty/truncated JSON (whose
+     * `if (cmdJson)` check then silently skips the load). The
+     * symptom from the test side: SET_OPEN_TOOL returns OK,
+     * overtake_mode never reaches 2. */
+    if (fsync(jfd) < 0) {
+        close(jfd);
+        return protocol_reply_err(fd, "SET_OPEN_TOOL: fsync failed");
+    }
+    close(jfd);
+
+    /* 2. Raise the SHM flag. Now safe — file is on disk and
+     * shadow_ui's read will see the JSON. */
+    __atomic_store_n(&g_shm.control->open_tool_cmd, 1, __ATOMIC_RELEASE);
+
+    return protocol_reply(fd, "OK");
+}
+
 static int cmd_quit(int fd, const char *args) {
     (void)args;
     /* Symmetric with the post-disconnect cleanup in schwung_testd.c —
@@ -340,6 +443,7 @@ static const command_entry_t g_commands[] = {
     {"SNAPSHOT_STEP_LEDS",cmd_snapshot_step_leds},
     {"STATE",             cmd_state},
     {"RESTART_MOVE",      cmd_restart_move},
+    {"SET_OPEN_TOOL",     cmd_set_open_tool},
     {"SUBSCRIBE",         cmd_subscribe},
     {"UNSUBSCRIBE",       cmd_unsubscribe},
     {"DUMP",              cmd_dump},
