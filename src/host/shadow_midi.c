@@ -616,6 +616,32 @@ void shadow_drain_midi_inject(void)
     /* Inject into shadow_mailbox at MIDI_IN_OFFSET */
     uint8_t *midi_in = host_shadow_mailbox + MIDI_IN_OFFSET;
 
+    /* Resolve the shadow_ui MIDI buffer once per drain — used to forward
+     * injected events to an active overtake JS module. host_shadow_ui_midi_shm
+     * is `uint8_t **`; the inner pointer is NULL on hosts that haven't mapped
+     * the shadow_ui buffer (older shim configurations, baseline mode).
+     *
+     * Rationale: the post-ioctl shim scan (schwung_shim.c:6606) reads from
+     * the *hardware* MIDI_IN to forward CCs/notes to shadow_ui — but injected
+     * events live in the *shadow* buffer here, then get copied to hardware
+     * for Move firmware, which consumes them before the post-ioctl scan
+     * runs. Without this publish, INJECT_MIDI from schwung-testd reaches
+     * Move firmware (selected_slot updates etc.) but never reaches an
+     * overtake module's onMidiMessageInternal — which means E2E tests can
+     * verify shim state but not drive ion/m8/etc. input behavior.
+     *
+     * Gate: only publish when an overtake module is currently active
+     * (shadow_control->overtake_mode == 2). In OVERTAKE_NORMAL (0) and
+     * OVERTAKE_MENU (1), shadow_ui's own onMidiMessageInternal is fed
+     * through different paths and we'd risk duplicate events. */
+    uint8_t *ui_midi = NULL;
+    if (host_shadow_ui_midi_shm && host_shadow_control) {
+        shadow_control_t *ctl = *host_shadow_control;
+        if (ctl && ctl->overtake_mode == 2) {
+            ui_midi = *host_shadow_ui_midi_shm;
+        }
+    }
+
     int hw_offset = 0;
     int injected = 0;
     int consumed_bytes = 0;
@@ -645,6 +671,43 @@ void shadow_drain_midi_inject(void)
         hw_offset += MIDI_IN_EVT_STRIDE;
         injected++;
         consumed_bytes = i + 4;
+
+        /* Publish to shadow_ui MIDI buffer for the active overtake module.
+         * The buffer is a flat array of MIDI_BUFFER_SIZE (256) bytes laid
+         * out as 64 × 4-byte slots: slot[0]=head (cable+CIN; 0=empty),
+         * slot[1..3]=status/d1/d2. Producer claims the first empty slot
+         * (acquire-load on head); consumer (shadow_ui.c process_shadow_midi)
+         * release-stores 0 back after reading. Same protocol as
+         * shadow_ui_midi_publish() in schwung_shim.c.
+         *
+         * Single-producer model preserved: only the SPI thread writes to
+         * ui_midi (shim's post-ioctl forward and now this drain both run
+         * in shim_post_transfer / shim_pre_transfer on the same thread). */
+        if (ui_midi) {
+            uint8_t head   = local_buf[i];
+            uint8_t status = local_buf[i + 1];
+            uint8_t d1     = local_buf[i + 2];
+            uint8_t d2     = local_buf[i + 3];
+            uint8_t cin    = head & 0x0F;
+            /* Same CIN range gate the consumer applies (CIN 0x04..0x0E):
+             * skip empty slots (head==0) and reserved CINs the consumer
+             * would discard anyway. */
+            if (head != 0 && cin >= 0x04 && cin <= 0x0E) {
+                for (int slot = 0; slot < MIDI_BUFFER_SIZE; slot += 4) {
+                    if (__atomic_load_n(&ui_midi[slot], __ATOMIC_ACQUIRE) == 0) {
+                        ui_midi[slot + 1] = status;
+                        ui_midi[slot + 2] = d1;
+                        ui_midi[slot + 3] = d2;
+                        __atomic_store_n(&ui_midi[slot], head, __ATOMIC_RELEASE);
+                        break;
+                    }
+                }
+                /* No-op if buffer is full (consumer hasn't drained yet) —
+                 * test-bus inject is best-effort, and the carryover path
+                 * below will keep the event in the inject_shm buffer for
+                 * the next frame anyway. Don't block the drain. */
+            }
+        }
     }
 
     /* Carry over any undrained packets so they fire in subsequent frames.
