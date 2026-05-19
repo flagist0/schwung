@@ -4,6 +4,46 @@
 > Append new findings at the bottom; keep the executive summary at top
 > in sync.
 
+## TL;DR (start here)
+
+1. **Root cause of Move's "always-hot" main thread = an O(N_sets)
+   filesystem walker that fires ~460 times per second** with no
+   inotify and no cache. Walker entry `FUN_01c6ec4c` in
+   `MoveOriginal`, leaf `FUN_01c75b48` (getxattr wrapper). Triggered
+   structurally by Browser/SongWheel view-model rebuilds.
+2. **Empirically: 32,200 getxattr/sec on the test device** (14 sets),
+   evenly distributed across 5 song-state xattr keys. Drops only 7%
+   when ion takes over the UI. Constant ~25% of one core baseline.
+3. **NOT the cause: Ableton Cloud sync** (disproved by RefreshToken
+   A/B), the post-restart "spike" (it's the new steady state, not
+   transient), or schwung's sync logging (batched version showed no
+   variance reduction).
+4. **The diagnostic tooling now lives in this repo** on branch
+   `claude/distracted-curran-2f1183` (pushed to flagist0/schwung):
+   - `src/host/sampling_profiler.{c,h}` — `perf_event_open(pid=0)`
+     self-profiler in shim. Trigger:
+     `touch /data/UserData/schwung/profile_on` + restart_move.
+   - `src/host/xattr_counter.c` — passive LD_PRELOAD interposer
+     counting getxattr/setxattr per second. Trigger:
+     `touch /data/UserData/schwung/xattr_count_on`.
+   - `tools/sampling_profiler/{parse_sprof,libc_lookup}.py` +
+     `README.md` — offline symbolication + `--folded` mode for
+     flamegraph.pl.
+5. **Sketched-but-not-implemented mitigation**: shim-side LD_PRELOAD
+   `getxattr`/`setxattr` cache keyed on (inode, key). Drops 25% to
+   near-zero. Risk: external writers (Cloud sync daemon?) bypass
+   the cache; needs `inotify(IN_ATTRIB)` invalidation thread for
+   correctness. See Phase 6.6. **User approval needed before
+   implementing.**
+6. **Useful reference data on local disk**:
+   - `/tmp/profile.bin` — most recent 25 s profile (11,574 samples)
+   - `/tmp/profile_baseline.bin` — earlier identical-ish profile
+   - `/tmp/profile.bin.symbols.txt` — libc symbol table for that
+     profile (`<lib> <hex> <sym>` format, auto-found by parser)
+   - `/tmp/profile.folded` — pre-folded for flamegraph.pl
+   - `/tmp/xattr_phases.log` — capture spanning idle → ion-loaded
+   - `/tmp/xattr_restart.log` — capture spanning restart_move
+
 ## Executive summary
 
 Move's `MoveOriginal` main thread (TID == PID, SCHED_OTHER) consumes
