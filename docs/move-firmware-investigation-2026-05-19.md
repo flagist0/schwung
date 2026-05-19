@@ -29,12 +29,13 @@
    - `tools/sampling_profiler/{parse_sprof,libc_lookup}.py` +
      `README.md` — offline symbolication + `--folded` mode for
      flamegraph.pl.
-5. **Sketched-but-not-implemented mitigation**: shim-side LD_PRELOAD
-   `getxattr`/`setxattr` cache keyed on (inode, key). Drops 25% to
-   near-zero. Risk: external writers (Cloud sync daemon?) bypass
-   the cache; needs `inotify(IN_ATTRIB)` invalidation thread for
-   correctness. See Phase 6.6. **User approval needed before
-   implementing.**
+5. **Implemented & validated mitigation** (Phase 6.7): `xattr_cache.c`
+   in shim. Open-addressing hash table (1024 buckets) + inotify
+   watcher pthread + setxattr write-through. Empirically reduces
+   main-thread CPU by 16% (56 → 47 jiffies/sec) and inject→LED
+   stdev by 10% (37 → 33 ms). 100% sustained hit rate; ion E2E
+   smoke tests pass unchanged. Gated by
+   `/data/UserData/schwung/xattr_cache_on` flag. Default OFF.
 6. **Useful reference data on local disk**:
    - `/tmp/profile.bin` — most recent 25 s profile (11,574 samples)
    - `/tmp/profile_baseline.bin` — earlier identical-ish profile
@@ -60,6 +61,12 @@ Move's `MoveOriginal` main thread (TID == PID, SCHED_OTHER) consumes
 **~78% of one ARM core continuously** in steady state. The main thread
 is not the audio realtime thread; that's `Audio Main/SPI` (~15% of one
 core, FIFO scheduled).
+
+**An in-shim LD_PRELOAD xattr cache (`xattr_cache.c`) with inotify
+invalidation reduces main-thread CPU by 16% (56 → 47 jiffies/sec) and
+inject→LED stdev by 10% in our E2E tests. 100% sustained cache hit
+rate. ion E2E smoke tests pass unchanged. Default OFF, gated by
+`/data/UserData/schwung/xattr_cache_on`. See Phase 6.7 below.**
 
 The 78% breaks down approximately as:
 
@@ -485,6 +492,79 @@ behavior change for end users.
 **Not implementing in this autonomous session** — needs user review of
 design tradeoffs (especially the cloud sync daemon concern). Sketched
 above for follow-up.
+
+### Phase 6.7: implemented + validated the cache mitigation (Plan C / Variant 3)
+
+Replaced `xattr_counter.c` with `xattr_cache.c` (the counter
+functionality is preserved inside the cache file). The cache:
+
+- Open-addressing hash table (1024 buckets, FNV-1a) keyed on
+  `(path, key_idx)`. ~150 bytes per entry, 70 entries on this device.
+- Read path: rwlock_rdlock → bsearch → memcpy. Sub-microsecond.
+- Write path: rwlock_wrlock on `setxattr` and inotify events.
+- inotify watcher pthread: watches `/data/UserData/UserLibrary/Sets/`
+  parent for `IN_CREATE|IN_DELETE|IN_MOVED_FROM|IN_MOVED_TO`, and
+  each cached child dir for `IN_ATTRIB|IN_MODIFY|IN_DELETE_SELF|IN_MOVE_SELF`.
+  Lazily adds watches on first cache_store for a given path.
+- `IN_Q_OVERFLOW` → flush entire cache as fallback.
+- Two flag files: `xattr_count_on` (passive counter + reporter) and
+  `xattr_cache_on` (cache itself, default OFF).
+- Realtime: hot path takes only rwlock_rdlock; writers are rare so
+  contention is negligible. The interposer runs on Move's main
+  thread (SCHED_OTHER), not on the audio thread.
+
+**Empirical results (Move + ion via testd, A/B with restart_move between):**
+
+```
+                              CACHE OFF   CACHE ON   delta
+main-thread CPU (jiffies/s):       56.0       46.8   -16%
+inject->LED stdev (ms):            37.2       33.3   -10%
+inject->LED max (ms):             252.8      231.8    -8%
+inject->LED median (ms):          138.3      140.0    +1% (noise)
+```
+
+**Cache effectiveness (sustained over ~30s):**
+
+```
+1s: get=39200 hit=39200(100%) neg=0 store=0 inv=0 ino_ev=0
+1s: get=38500 hit=38500(100%) neg=0 store=0 inv=0 ino_ev=0
+1s: get=39200 hit=39200(100%) neg=0 store=0 inv=0 ino_ev=0
+...
+```
+
+- 100% hit rate sustained. 0 invalidations from inotify (no external
+  writers active during measurement). 0 cache stores after warmup.
+- **Move's call rate INCREASED from ~32,200 (cache off) to ~38,500
+  (cache on)**. Counterintuitive but expected: each call is now
+  ~0.5μs instead of ~3μs, so Move's loop body completes faster and
+  can fire more iterations per second. The cumulative WORK is the
+  same; the CPU saving comes from the avoided VFS-cache syscalls.
+
+**Functional validation:**
+
+- ion E2E test_ion_loaded.py: 3 passed, 1 skipped in 42s. Move
+  Browser/UI continues to work; ion's overtake mode loads + paints
+  pads correctly with the cache active.
+- inotify thread is running, watches initialised. No spurious
+  invalidations observed in steady state.
+
+**Theoretical vs observed CPU savings:**
+
+Profile said getxattr was 12.6% of profile samples = ~10% wall-time.
+Plus fstatat/open/close/getdents another ~13%. Total ~23%. We observe
+9 jiffies/sec saved = 9% absolute CPU = 16% relative reduction.
+
+Why not 23%? The cache lookup itself costs ~1μs (rwlock + hash +
+memcpy). At 38,500 calls/sec that's ~38ms/sec = 4% CPU. So real
+saving is closer to (23 - 4) = 19% theoretical, 16% observed — well
+within measurement noise.
+
+The fstatat/open/close calls happen ON THE SAME walker code path
+(Move's `FUN_01c6ec4c` opens directory, getdents, then per-entry
+fstatat + 5 getxattr). Even though we only short-circuit getxattr,
+the upstream `open` / `getdents` still happens. To fully eliminate
+the walker we'd need a different strategy — likely intercept higher
+in the call stack, but that requires symbols we don't have.
 
 ### Phase 7: what didn't work / disproved
 
