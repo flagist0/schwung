@@ -232,6 +232,49 @@ class SchwungBus:
     _inject_min_gap_s: float = float(os.environ.get("SCHWUNG_INJECT_MIN_GAP_S", "0") or 0)
     _last_inject_at: float = 0.0
 
+    # Optional minimum wall-clock spacing between ANY two mutation
+    # operations (inject_midi, set_param, set_param_from_file,
+    # set_open_tool, restart_move). Set via the SCHWUNG_THROTTLE_MS
+    # env var (integer milliseconds). Default 0 = no throttling
+    # (matches legacy behavior).
+    #
+    # Reads (state, snapshot_*, get_param, ping, dump_param_to_file)
+    # are NOT throttled — they don't pressure Move's main thread
+    # and many polling loops depend on them firing tightly.
+    #
+    # Empirical note (full ion E2E suite, May 2026):
+    #   throttle=0   wall=336s drops=2161 (386/min)
+    #   throttle=50  wall=483s drops=2594 (322/min)
+    #
+    # Throttling DOES reduce drops-per-minute (Move's audio thread
+    # gets more breathing room between our mutations) but absolute
+    # drops over the whole suite go UP because the suite takes
+    # longer — Move's baseline "drops during test activity" rate
+    # accumulates over more wall time. So this knob is documented
+    # but not on by default; it's useful as a research lever for
+    # single-test variance studies. The real win for frame drops
+    # is reducing restart_move count (class-scoped fixtures, etc.) —
+    # 41 restarts × ~3 s boot under load is ~36% of suite time and
+    # is the dominant drop source.
+    _throttle_s: float = float(os.environ.get("SCHWUNG_THROTTLE_MS", "0") or 0) / 1000.0
+    _last_mutation_at: float = 0.0
+
+    def _throttle_mutation(self) -> None:
+        """Sleep just enough so the last mutation was at least
+        ``self._throttle_s`` seconds ago. Called by every mutation
+        method below. No-op if throttling is disabled."""
+        if self._throttle_s <= 0:
+            return
+        elapsed = time.monotonic() - self._last_mutation_at
+        if elapsed < self._throttle_s:
+            time.sleep(self._throttle_s - elapsed)
+        # Stamp BEFORE returning so the next mutation measures
+        # from this call's start (not its end — that would let
+        # the actual network round-trip "free-ride" inside the
+        # throttle window and the next mutation could start
+        # before Move's main thread has had a chance to drain).
+        self._last_mutation_at = time.monotonic()
+
     def inject_midi(self, packet: bytes) -> None:
         """Inject one 4-byte USB-MIDI packet into Move's MIDI_IN buffer.
 
@@ -251,6 +294,7 @@ class SchwungBus:
             elapsed = time.monotonic() - self._last_inject_at
             if elapsed < self._inject_min_gap_s:
                 time.sleep(self._inject_min_gap_s - elapsed)
+        self._throttle_mutation()
         self._request("INJECT_MIDI " + packet.hex())
         if self._inject_min_gap_s > 0:
             self._last_inject_at = time.monotonic()
@@ -522,6 +566,7 @@ class SchwungBus:
         keeps them mapped). The shim re-attaches to existing segments
         on init, so frame counter continuity is preserved.
         """
+        self._throttle_mutation()
         self._request("RESTART_MOVE")
 
     def set_open_tool(self, module_id: str) -> None:
@@ -562,6 +607,7 @@ class SchwungBus:
             )
         if len(module_id) > 64:
             raise ValueError(f"module_id too long ({len(module_id)} > 64)")
+        self._throttle_mutation()
         self._request(f"SET_OPEN_TOOL {module_id}")
 
     # ----- param get/set (routes through /schwung-param) -------------------
@@ -656,6 +702,7 @@ class SchwungBus:
         full_key = f"overtake_dsp:{key}" if overtake else key
         if " " in full_key:
             raise ValueError(f"param key may not contain spaces: {full_key!r}")
+        self._throttle_mutation()
         self._param_request_with_retry(f"SET_PARAM {full_key} {value}")
 
     def get_param(self, key: str, overtake: bool = True) -> str:
@@ -753,6 +800,7 @@ class SchwungBus:
         import re
         if re.search(r'\s', full_key) or re.search(r'\s', move_path):
             raise ValueError("param key / path may not contain whitespace")
+        self._throttle_mutation()
         self._param_request_with_retry(f"SET_PARAM_FILE {full_key} {move_path}")
 
     def dump_param_to_file(self, key: str, move_path: str,
