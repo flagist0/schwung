@@ -254,7 +254,7 @@ if needs_rebuild build/schwung-shim.so \
     src/host/shadow_chain_mgmt.c src/host/shadow_link_audio.c src/host/shadow_process.c \
     src/host/shadow_resample.c src/host/shadow_overlay.c src/host/shadow_pin_scanner.c \
     src/host/shadow_led_queue.c src/host/shadow_fd_trace.c src/host/shadow_state.c \
-    src/host/shadow_midi.c src/host/unified_log.c \
+    src/host/shadow_midi.c src/host/unified_log.c src/host/schwung_trace.c \
     $SHIM_TTS_SRC \
     src/host/shadow_constants.h src/host/shadow_midi.h src/host/shadow_sampler.h \
     src/host/shadow_set_pages.h src/host/shadow_dbus.h src/host/shadow_chain_mgmt.h \
@@ -262,6 +262,7 @@ if needs_rebuild build/schwung-shim.so \
     src/host/shadow_resample.h src/host/shadow_overlay.h src/host/shadow_pin_scanner.h \
     src/host/shadow_led_queue.h src/host/shadow_fd_trace.h src/host/shadow_state.h \
     src/host/plugin_api_v1.h src/host/unified_log.h src/host/tts_engine.h \
+    src/host/schwung_trace.h \
     src/host/link_audio.h; then
     echo "Building shim..."
     "${CROSS_PREFIX}gcc" -g3 -shared -fPIC \
@@ -283,6 +284,7 @@ if needs_rebuild build/schwung-shim.so \
         src/host/shadow_state.c \
         src/host/shadow_midi.c \
         src/host/unified_log.c \
+        src/host/schwung_trace.c \
         $SHIM_TTS_SRC \
         $SHIM_DEFINES \
         $SHIM_INCLUDES \
