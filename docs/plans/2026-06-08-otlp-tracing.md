@@ -73,13 +73,23 @@ typedef struct {
 } trace_rec_t;              /* 48 bytes */
 ```
 
-Ring: preallocated `trace_rec_t buf[TRACE_RING_CAP]` (power-of-two), a
-single `_Atomic uint64_t write_seq`. Producers CAS-free: each takes a
-slot via `atomic_fetch_add(write_seq, 1)` (MPSC), writes its record, done.
-The exporter reads up to `write_seq`, tracking its own read cursor; if
-producers lapped it (`write_seq - read > CAP`), it skips the gap and
-counts drops (exported as a `trace.dropped` counter). No locks; tear-free
-via the seq fence.
+Ring (as implemented): **one SPSC ring per producer thread**, not a single
+shared MPSC ring. A fixed pool `trace_ring_t g_rings[TRACE_MAX_THREADS]`
+(each `{ _Atomic w, _Atomic r, _Atomic dropped, buf[CAP] }`, CAP a power of
+two) is claimed lazily — a thread grabs its slot via
+`atomic_fetch_add(g_ring_count, 1)` on first push and caches it in a
+thread-local `t_ring`. Single producer per ring → the producer owns `w`
+(release on publish), the exporter owns `r`; the producer reads `r` only to
+check fullness (drop-on-full, `dropped++`). The exporter enumerates the
+first `g_ring_count` rings, drains each with an acquire-load on `w`, and on
+lap (`w - r > CAP`) skips the overwritten span(s) and credits `dropped`.
+No locks; tear-free via per-ring `w` release / acquire.
+
+> Per-thread SPSC (vs the originally-sketched single MPSC seq counter) keeps
+> each producer's writes contention-free and makes the Phase-2 move to a
+> shared-SHM layout a deliberate redesign of ring ownership, not a drop-in
+> `shm_open`. The `dropped` counters are tracked but not yet emitted as OTLP
+> spans/metrics — surfacing them is a follow-up.
 
 ### Name interning
 

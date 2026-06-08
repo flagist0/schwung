@@ -37,6 +37,8 @@ ssh ableton@move.local "tail -f /data/UserData/schwung/debug.log"
 
 JS: `console.log()` (auto-routed) or import `shared/logger.mjs`. C: `LOG_DEBUG("source", "msg")` from `host/unified_log.h`. See `docs/LOGGING.md`.
 
+**OTLP span tracing** (perf profiling, off by default): `touch /data/UserData/schwung/otlp_trace_on` makes the shim emit realtime-safe spans (`spi.pre`/`spi.post` roots + `param.serve`, `shadow.mix_audio`, `midi.process` children) as OTLP/JSONL to `/data/UserData/schwung/traces/` for replay into Tempo/Jaeger. `rm` the file to stop. Zero hot-path cost when off. See `docs/plans/2026-06-08-otlp-tracing.md`.
+
 ## Device Constraints
 
 **Never write to `/tmp` on the Move device.** Root FS (`/`) is ~463MB and usually 100% full; `/tmp` lives there. **Always** use `/data/UserData/` (~49GB free) for logs, recordings, temp files, everything. The unified logger already writes to `/data/UserData/schwung/debug.log`.
@@ -57,7 +59,7 @@ Modules (src/modules/<id>/):
   dsp.so            # Optional native DSP plugin
 ```
 
-Key sources: `src/schwung_host.c` (host runtime), `src/schwung_shim.c` (LD_PRELOAD shim), `src/host/module_manager.c`, `src/host/menu_ui.js`, `src/host/plugin_api_v1.h`.
+Key sources: `src/schwung_host.c` (host runtime), `src/schwung_shim.c` (LD_PRELOAD shim), `src/host/module_manager.c`, `src/host/menu_ui.js`, `src/host/plugin_api_v1.h`, `src/host/schwung_trace.{c,h}` (OTLP span tracing).
 
 Built-in modules: `chain`, `store`, `file-browser`, `song-mode`, `wav-player`.
 Source-only (not in release tarball): `controller` (superseded by catalog `control`), `tools/{ui,seq,config,splash}-test`, `text-test`.

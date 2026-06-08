@@ -19,8 +19,12 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
+#include <dirent.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include "unified_log.h"   /* exporter thread is non-RT → logging is safe here */
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -41,6 +45,7 @@ static inline uint32_t os_tid(void) { return (uint32_t)(uintptr_t)pthread_self()
 #define TRACE_DIR          "/data/UserData/schwung/traces"
 #define TRACE_FILE_FMT     TRACE_DIR "/schwung-%s.otlp.jsonl"
 #define TRACE_ROTATE_BYTES (8 * 1024 * 1024)
+#define TRACE_MAX_FILES    16              /* keep at most this many trace files */
 #define TRACE_EXPORT_SLEEP_US 50000        /* 50 ms drain cadence */
 
 /* ---- Span record (internal; .h keeps trace_handle_t opaque) --------- */
@@ -56,7 +61,7 @@ typedef struct {
 /* ---- Per-thread SPSC ring ------------------------------------------- */
 typedef struct {
     _Atomic uint64_t w;                    /* producer-only writes (RELEASE) */
-    uint64_t         r;                    /* exporter-only */
+    _Atomic uint64_t r;                    /* exporter-only writes; producer reads */
     _Atomic uint64_t dropped;
     trace_rec_t      buf[TRACE_RING_CAP];
 } trace_ring_t;
@@ -74,16 +79,16 @@ static __thread uint32_t      t_tid     = 0;
 /* ---- Global state --------------------------------------------------- */
 _Atomic int schwung_trace_on = 0;
 
-static const char    *g_names[TRACE_MAX_NAMES];
+static _Atomic(const char *) g_names[TRACE_MAX_NAMES];
 static _Atomic uint32_t g_name_count = 0;
 
 static _Atomic uint64_t g_span_seq  = 0;
 static _Atomic uint64_t g_trace_seq = 0;
 
 static char        g_service[64] = "schwung";
-static int         g_inited = 0;
+static int         g_inited = 0;        /* set in constructor before any RT thread */
 static pthread_t   g_exporter;
-static int         g_exporter_running = 0;
+static _Atomic int g_exporter_running = 0;
 static _Atomic int g_exporter_stop = 0;
 
 /* MONOTONIC_RAW ↔ REALTIME offset, sampled at init (ns). */
@@ -106,7 +111,9 @@ static inline uint64_t real_ns(void) {
 uint32_t schwung_trace_intern(const char *name) {
     uint32_t idx = atomic_fetch_add_explicit(&g_name_count, 1, memory_order_relaxed);
     if (idx >= TRACE_MAX_NAMES) return 1;          /* table full → bucket 1 */
-    g_names[idx] = name;                           /* literal: static lifetime */
+    /* Release-store the literal so the exporter, which acquire-loads the slot,
+     * never sees the id published with a stale/NULL pointer (ARM64 reorders). */
+    atomic_store_explicit(&g_names[idx], name, memory_order_release);
     return idx + 1;                                /* ids are 1-based */
 }
 
@@ -119,7 +126,7 @@ static inline void ring_push(const trace_rec_t *rec) {
         ring = t_ring = &g_rings[i];
     }
     uint64_t w = atomic_load_explicit(&ring->w, memory_order_relaxed);
-    uint64_t r = ring->r;          /* stale read of exporter cursor is fine */
+    uint64_t r = atomic_load_explicit(&ring->r, memory_order_relaxed);  /* stale ok, not torn */
     if (w - r >= TRACE_RING_CAP) {                 /* full → drop, count it */
         atomic_fetch_add_explicit(&ring->dropped, 1, memory_order_relaxed);
         return;
@@ -187,14 +194,55 @@ static uint64_t to_unix_ns(uint64_t mono) {
 static FILE  *g_out = NULL;
 static long   g_out_bytes = 0;
 
+/* Keep at most TRACE_MAX_FILES trace files: unlink the oldest before opening a
+ * new one. Filenames are schwung-YYYYMMDD-HHMMSS.otlp.jsonl, so lexicographic
+ * order == chronological order. Bounds disk use even if the touch-file is left
+ * on for days (/data is ~49 GB but not infinite). */
+static void prune_old_files(void) {
+    DIR *d = opendir(TRACE_DIR);
+    if (!d) return;
+    char names[64][48];
+    int count = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && count < 64) {
+        if (strncmp(de->d_name, "schwung-", 8) == 0 &&
+            strstr(de->d_name, ".otlp.jsonl") != NULL) {
+            snprintf(names[count], sizeof(names[count]), "%s", de->d_name);
+            count++;
+        }
+    }
+    closedir(d);
+    /* insertion sort ascending (oldest first) */
+    for (int i = 1; i < count; i++) {
+        char key[48];
+        snprintf(key, sizeof(key), "%s", names[i]);
+        int j = i - 1;
+        while (j >= 0 && strcmp(names[j], key) > 0) {
+            snprintf(names[j + 1], sizeof(names[j + 1]), "%s", names[j]);
+            j--;
+        }
+        snprintf(names[j + 1], sizeof(names[j + 1]), "%s", key);
+    }
+    int to_delete = count - (TRACE_MAX_FILES - 1);   /* leave room for the new file */
+    for (int i = 0; i < to_delete && i < count; i++) {
+        char p[320];
+        snprintf(p, sizeof(p), "%s/%s", TRACE_DIR, names[i]);
+        unlink(p);
+    }
+}
+
 static void open_outfile(void) {
-    mkdir(TRACE_DIR, 0755);
+    if (mkdir(TRACE_DIR, 0755) != 0 && errno != EEXIST)
+        unified_log("trace", LOG_LEVEL_ERROR, "mkdir %s failed: errno %d", TRACE_DIR, errno);
+    prune_old_files();
     char path[256], stamp[32];
     time_t now = time(NULL);
     struct tm tmv; localtime_r(&now, &tmv);
     strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tmv);
     snprintf(path, sizeof(path), TRACE_FILE_FMT, stamp);
     g_out = fopen(path, "w");
+    if (!g_out)
+        unified_log("trace", LOG_LEVEL_ERROR, "fopen %s failed: errno %d", path, errno);
     g_out_bytes = 0;
 }
 
@@ -209,8 +257,10 @@ static void write_batch(const trace_rec_t *spans, int n) {
         g_service);
     for (int i = 0; i < n; i++) {
         const trace_rec_t *s = &spans[i];
-        const char *nm = (s->name_id >= 1 && s->name_id <= atomic_load(&g_name_count)
-                          && g_names[s->name_id - 1]) ? g_names[s->name_id - 1] : "?";
+        uint32_t nc = atomic_load_explicit(&g_name_count, memory_order_acquire);
+        const char *nm_p = (s->name_id >= 1 && s->name_id <= nc)
+            ? atomic_load_explicit(&g_names[s->name_id - 1], memory_order_acquire) : NULL;
+        const char *nm = nm_p ? nm_p : "?";
         /* 128-bit OTLP traceId: high 64 bits zero, low 64 = our trace_id. */
         char traceid32[33];
         memset(traceid32, '0', 16);
@@ -218,7 +268,7 @@ static void write_batch(const trace_rec_t *spans, int n) {
         traceid32[32] = 0;
         hex16(s->span_id, sid);
         hex16(s->parent_id, pid);
-        g_out_bytes += fprintf(g_out,
+        fprintf(g_out,
             "%s{\"traceId\":\"%s\",\"spanId\":\"%s\",%s%s%s"
             "\"name\":\"%s\",\"kind\":1,"
             "\"startTimeUnixNano\":\"%llu\",\"endTimeUnixNano\":\"%llu\","
@@ -234,6 +284,8 @@ static void write_batch(const trace_rec_t *spans, int n) {
     }
     fputs("]}]}]}\n", g_out);
     fflush(g_out);
+    long pos = ftell(g_out);              /* true file size incl. JSON envelope */
+    if (pos >= 0) g_out_bytes = pos;
     if (g_out_bytes >= TRACE_ROTATE_BYTES) {
         fclose(g_out); g_out = NULL; open_outfile();
     }
@@ -251,16 +303,22 @@ static void *exporter_main(void *arg) {
         for (int i = 0; i < rc; i++) {
             trace_ring_t *ring = &g_rings[i];
             uint64_t w = atomic_load_explicit(&ring->w, memory_order_acquire);
-            uint64_t r = ring->r;
-            if (w - r > TRACE_RING_CAP) r = w - TRACE_RING_CAP;   /* lapped */
+            uint64_t r = atomic_load_explicit(&ring->r, memory_order_relaxed);
+            if (w - r > TRACE_RING_CAP) {            /* producer lapped us */
+                uint64_t skipped = (w - TRACE_RING_CAP) - r;
+                atomic_fetch_add_explicit(&ring->dropped, skipped, memory_order_relaxed);
+                r = w - TRACE_RING_CAP;             /* skip the overwritten span(s) */
+            }
             while (r < w && n < (int)(sizeof(batch)/sizeof(batch[0]))) {
                 batch[n++] = ring->buf[r & TRACE_RING_MASK];
                 r++;
             }
-            ring->r = r;
+            atomic_store_explicit(&ring->r, r, memory_order_relaxed);
         }
         if (n > 0) write_batch(batch, n);
-        else       usleep(TRACE_EXPORT_SLEEP_US);
+        /* Always sleep — cap exporter I/O to one burst per cadence even when
+         * the ring keeps producing (otherwise this spins on cores 0-2). */
+        usleep(TRACE_EXPORT_SLEEP_US);
     }
     if (g_out) { fclose(g_out); g_out = NULL; }
     return NULL;
