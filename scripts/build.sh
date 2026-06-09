@@ -323,16 +323,18 @@ fi
 # Build Shadow UI host (uses shared display bindings from js_display.c)
 if needs_rebuild build/shadow/shadow_ui \
     src/shadow/shadow_ui.c src/host/js_display.c src/host/unified_log.c \
-    src/host/analytics.c \
-    src/host/js_display.h src/host/shadow_constants.h src/host/unified_log.h; then
+    src/host/analytics.c src/host/schwung_trace.c \
+    src/host/js_display.h src/host/shadow_constants.h src/host/unified_log.h \
+    src/host/schwung_trace.h; then
     echo "Building Shadow UI..."
     "${CROSS_PREFIX}gcc" -g -O3 \
         src/shadow/shadow_ui.c \
         src/host/js_display.c \
         src/host/unified_log.c \
         src/host/analytics.c \
+        src/host/schwung_trace.c \
         -o build/shadow/shadow_ui \
-        -Isrc -Isrc/lib \
+        -Isrc -Isrc/lib -Isrc/host \
         -Ilibs/quickjs/quickjs-2025-04-26 \
         -Llibs/quickjs/quickjs-2025-04-26 \
         -lquickjs -lm -ldl -lrt -lpthread
