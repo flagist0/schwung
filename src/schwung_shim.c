@@ -7813,7 +7813,7 @@ static void shim_spi_init(void)
     }
 
     /* Initialize OTLP span tracing (OFF unless the touch-file is present;
-     * see docs/plans/2026-06-08-otlp-tracing.md). Cheap: just samples the
+     * see docs/tracing.md). Cheap: just samples the
      * clock offset and polls the gate once. The exporter thread is started
      * lazily by poll_enable, on its own SCHED_OTHER schedule off core 3. */
     schwung_trace_init("schwung-shim");

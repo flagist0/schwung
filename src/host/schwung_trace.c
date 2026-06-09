@@ -1,6 +1,6 @@
 /*
  * schwung_trace.c — realtime-safe span tracing, OTLP/JSON file exporter.
- * See schwung_trace.h and docs/plans/2026-06-08-otlp-tracing.md.
+ * See schwung_trace.h and docs/tracing.md.
  *
  * Emission (hot path, incl. SPI core 3): per-thread SPSC ring, no alloc /
  * lock / I/O. Export: one SCHED_OTHER thread drains every thread's ring,

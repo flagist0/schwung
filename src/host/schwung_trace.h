@@ -1,7 +1,7 @@
 /*
  * schwung_trace.h — realtime-safe span tracing with OTLP export.
  *
- * Design + rationale: docs/plans/2026-06-08-otlp-tracing.md
+ * Design + rationale: docs/tracing.md
  *
  * One-line instrumentation, no begin/end boilerplate:
  *
