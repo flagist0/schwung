@@ -59,7 +59,7 @@ Modules (src/modules/<id>/):
   dsp.so            # Optional native DSP plugin
 ```
 
-Key sources: `src/schwung_host.c` (host runtime), `src/schwung_shim.c` (LD_PRELOAD shim), `src/host/module_manager.c`, `src/host/menu_ui.js`, `src/host/plugin_api_v1.h`, `src/host/schwung_trace.{c,h}` (OTLP span tracing).
+Key sources: `src/schwung_host.c` (host runtime), `src/schwung_shim.c` (LD_PRELOAD shim), `src/host/module_manager.c`, `src/host/menu_ui.js`, `src/host/plugin_api_v1.h`.
 
 Built-in modules: `chain`, `store`, `file-browser`, `song-mode`, `wav-player`.
 Source-only (not in release tarball): `controller` (superseded by catalog `control`), `tools/{ui,seq,config,splash}-test`, `text-test`.
