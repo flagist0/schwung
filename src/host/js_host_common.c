@@ -121,6 +121,29 @@ int callGlobalFunction(JSContext *ctx, JSValue *pfunc, unsigned char *data) {
     return is_exception;
 }
 
+/* Like callGlobalFunction but delivers a variable-length byte array to the JS
+ * callback instead of a fixed 3-byte channel-voice event. Used for a
+ * reassembled SysEx message (e.g. a Bass Station II patch dump), which the
+ * 3-byte USB-MIDI packet path cannot carry. */
+int callGlobalFunctionN(JSContext *ctx, JSValue *pfunc,
+                        const unsigned char *data, int len) {
+    JSValue ret;
+    int is_exception;
+    JSValue arr = JS_NewArray(ctx);
+    for (int i = 0; i < len; i++) {
+        JS_SetPropertyUint32(ctx, arr, i, JS_NewInt32(ctx, data[i]));
+    }
+    JSValue args[1] = { arr };
+    ret = JS_Call(ctx, *pfunc, JS_UNDEFINED, 1, args);
+    JS_FreeValue(ctx, arr);
+    is_exception = JS_IsException(ret);
+    if (is_exception) {
+        js_std_dump_error(ctx);
+    }
+    JS_FreeValue(ctx, ret);
+    return is_exception;
+}
+
 /* ============================================================================
  * Path / process helpers
  * ============================================================================ */

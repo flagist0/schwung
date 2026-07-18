@@ -1081,6 +1081,18 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 
 #define js_move_midi_external_send_buffer_size 4096
 unsigned char js_move_midi_send_buffer[js_move_midi_external_send_buffer_size];
+
+/* Inbound SysEx reassembly (external / cable-2 USB-in). A SysEx message
+ * arrives as several 4-byte USB-MIDI packets (CIN 0x4 = start/continue,
+ * 0x5/0x6/0x7 = end with 1/2/3 data bytes); the fixed 3-byte JS/DSP path
+ * cannot carry it, so we accumulate the full F0..F7 message here and deliver
+ * it to onMidiMessageExternal in one variable-length call. State is file-scope
+ * so a message may straddle SPI frames. 1 KB caps an untrusted stream (a Bass
+ * Station II dump is 154 bytes). */
+#define SYSEX_IN_MAX 1024
+static unsigned char sysex_in_buf[SYSEX_IN_MAX];
+static int sysex_in_len = 0;
+static int sysex_in_active = 0;
 static JSValue js_move_midi_send(int cable, JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
@@ -2419,6 +2431,49 @@ int main(int argc, char *argv[])
 
             if (cable == 2)
             {
+                /* Reassemble SysEx (CIN 0x4 start/continue, 0x5/0x6/0x7 end
+                 * with 1/2/3 data bytes) before it reaches the 3-byte path,
+                 * which can't carry it. Non-sysex CIN falls through to the
+                 * unchanged CC/NRPN/note dispatch below. */
+                uint8_t cin = *byte & 0x0F;
+                if (cin >= 0x4 && cin <= 0x7) {
+                    int handled = 1;
+                    if (cin == 0x4) {
+                        /* start (F0 ...) or continue */
+                        if (byte[1] == 0xF0) { sysex_in_len = 0; sysex_in_active = 1; }
+                        if (sysex_in_active) {
+                            for (int b = 1; b <= 3 && sysex_in_len < SYSEX_IN_MAX; b++)
+                                sysex_in_buf[sysex_in_len++] = byte[b];
+                        }
+                    } else {
+                        /* 0x5/0x6/0x7 = sysex end with 1/2/3 data bytes. When
+                         * not mid-sysex a lone 0x5 is a 1-byte system-common
+                         * message, not a terminator — leave it to the normal
+                         * path. */
+                        if (sysex_in_active) {
+                            int nbytes = cin - 0x4; /* 0x5->1, 0x6->2, 0x7->3 */
+                            for (int b = 1; b <= nbytes && sysex_in_len < SYSEX_IN_MAX; b++)
+                                sysex_in_buf[sysex_in_len++] = byte[b];
+                            /* Complete F0..F7 message → JS only (never DSP). */
+                            if (callGlobalFunctionN(ctx, &JSonMidiMessageExternal,
+                                                    sysex_in_buf, sysex_in_len)) {
+                                printf("JS:onMidiMessageExternal(sysex) failed\n");
+                            }
+                            sysex_in_active = 0;
+                            sysex_in_len = 0;
+                        } else {
+                            handled = 0;
+                        }
+                    }
+                    /* Overrun on an untrusted stream: drop the partial message
+                     * rather than run past the buffer. */
+                    if (sysex_in_len >= SYSEX_IN_MAX) {
+                        sysex_in_active = 0;
+                        sysex_in_len = 0;
+                    }
+                    if (handled) continue;
+                }
+
                 /* External MIDI: no transforms - route to both JS and DSP */
                 /* Route to JS handler */
                 if (callGlobalFunction(ctx, &JSonMidiMessageExternal, &byte[1])) {
