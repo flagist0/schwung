@@ -124,18 +124,41 @@ int callGlobalFunction(JSContext *ctx, JSValue *pfunc, unsigned char *data) {
 /* Like callGlobalFunction but delivers a variable-length byte array to the JS
  * callback instead of a fixed 3-byte channel-voice event. Used for a
  * reassembled SysEx message (e.g. a Bass Station II patch dump), which the
- * 3-byte USB-MIDI packet path cannot carry. */
+ * 3-byte USB-MIDI packet path cannot carry.
+ *
+ * The bytes are handed over as a Uint8Array built from a single
+ * JS_NewArrayBufferCopy (one bulk copy), NOT boxed element-by-element into a
+ * JS array — a SysEx can be up to ~1 KB and this runs inside the SPI/MIDI hot
+ * loop, so per-element allocation there is avoided. The JS side indexes it
+ * exactly like the plain array the 3-byte path delivers (both have .length
+ * and [i]). */
 int callGlobalFunctionN(JSContext *ctx, JSValue *pfunc,
                         const unsigned char *data, int len) {
     JSValue ret;
     int is_exception;
-    JSValue arr = JS_NewArray(ctx);
-    for (int i = 0; i < len; i++) {
-        JS_SetPropertyUint32(ctx, arr, i, JS_NewInt32(ctx, data[i]));
+
+    JSValue ab = JS_NewArrayBufferCopy(ctx, data, (size_t)(len < 0 ? 0 : len));
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue u8ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
+    JSValue arr    = JS_CallConstructor(ctx, u8ctor, 1, &ab);
+
+    if (JS_IsException(arr)) {
+        js_std_dump_error(ctx);
+        JS_FreeValue(ctx, arr);
+        JS_FreeValue(ctx, u8ctor);
+        JS_FreeValue(ctx, global);
+        JS_FreeValue(ctx, ab);
+        return 1;
     }
+
     JSValue args[1] = { arr };
     ret = JS_Call(ctx, *pfunc, JS_UNDEFINED, 1, args);
+
     JS_FreeValue(ctx, arr);
+    JS_FreeValue(ctx, u8ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, ab);
+
     is_exception = JS_IsException(ret);
     if (is_exception) {
         js_std_dump_error(ctx);

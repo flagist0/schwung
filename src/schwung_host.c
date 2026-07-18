@@ -2442,22 +2442,35 @@ int main(int argc, char *argv[])
                         /* start (F0 ...) or continue */
                         if (byte[1] == 0xF0) { sysex_in_len = 0; sysex_in_active = 1; }
                         if (sysex_in_active) {
-                            for (int b = 1; b <= 3 && sysex_in_len < SYSEX_IN_MAX; b++)
-                                sysex_in_buf[sysex_in_len++] = byte[b];
+                            /* Overrun on an untrusted stream: abandon the
+                             * message rather than run past the buffer. */
+                            if (sysex_in_len + 3 > SYSEX_IN_MAX) {
+                                sysex_in_active = 0; sysex_in_len = 0;
+                            } else {
+                                for (int b = 1; b <= 3; b++)
+                                    sysex_in_buf[sysex_in_len++] = byte[b];
+                            }
                         }
                     } else {
-                        /* 0x5/0x6/0x7 = sysex end with 1/2/3 data bytes. When
-                         * not mid-sysex a lone 0x5 is a 1-byte system-common
-                         * message, not a terminator — leave it to the normal
-                         * path. */
-                        if (sysex_in_active) {
-                            int nbytes = cin - 0x4; /* 0x5->1, 0x6->2, 0x7->3 */
-                            for (int b = 1; b <= nbytes && sysex_in_len < SYSEX_IN_MAX; b++)
-                                sysex_in_buf[sysex_in_len++] = byte[b];
-                            /* Complete F0..F7 message → JS only (never DSP). */
-                            if (callGlobalFunctionN(ctx, &JSonMidiMessageExternal,
-                                                    sysex_in_buf, sysex_in_len)) {
-                                printf("JS:onMidiMessageExternal(sysex) failed\n");
+                        /* 0x5/0x6/0x7 = sysex end with 1/2/3 data bytes. A real
+                         * terminator's LAST byte is 0xF7; if it isn't (e.g. a
+                         * lone CIN 0x5 carrying a system-common 0xF6 Tune
+                         * Request), this is NOT our terminator — fall through to
+                         * the normal path and keep any reassembly intact. */
+                        int nbytes = cin - 0x4; /* 0x5->1, 0x6->2, 0x7->3 */
+                        if (sysex_in_active && byte[nbytes] == 0xF7) {
+                            if (sysex_in_len + nbytes > SYSEX_IN_MAX) {
+                                /* Would overrun — drop, don't deliver a silently
+                                 * truncated (unterminated) message to JS. */
+                                printf("JS:onMidiMessageExternal(sysex) dropped - overrun\n");
+                            } else {
+                                for (int b = 1; b <= nbytes; b++)
+                                    sysex_in_buf[sysex_in_len++] = byte[b];
+                                /* Complete F0..F7 message → JS only (never DSP). */
+                                if (callGlobalFunctionN(ctx, &JSonMidiMessageExternal,
+                                                        sysex_in_buf, sysex_in_len)) {
+                                    printf("JS:onMidiMessageExternal(sysex) failed\n");
+                                }
                             }
                             sysex_in_active = 0;
                             sysex_in_len = 0;
@@ -2465,13 +2478,17 @@ int main(int argc, char *argv[])
                             handled = 0;
                         }
                     }
-                    /* Overrun on an untrusted stream: drop the partial message
-                     * rather than run past the buffer. */
-                    if (sysex_in_len >= SYSEX_IN_MAX) {
-                        sysex_in_active = 0;
-                        sysex_in_len = 0;
-                    }
                     if (handled) continue;
+                }
+
+                /* A channel-voice message (status 0x80..0xEF) mid-reassembly
+                 * means the SysEx was abandoned (dropped packet / unplug); drop
+                 * the partial so a later stray byte can't be misread as its
+                 * terminator. Real-time (CIN 0xF, e.g. 0xF8 clock) may legally
+                 * interleave inside SysEx, so it must NOT abandon. */
+                if (sysex_in_active && (byte[1] & 0x80) && (byte[1] & 0xF0) != 0xF0) {
+                    sysex_in_active = 0;
+                    sysex_in_len = 0;
                 }
 
                 /* External MIDI: no transforms - route to both JS and DSP */
