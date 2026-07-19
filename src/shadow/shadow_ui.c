@@ -29,6 +29,7 @@
 #include "host/shadow_constants.h"
 #include "host/shadow_shm_util.h"
 #include "host/js_host_common.h"
+#include "host/sysex_reassemble.h"
 #include "host/shadow_midi_inject_writer.h"
 #include "../host/unified_log.h"
 #include "../host/analytics.h"
@@ -2543,6 +2544,12 @@ static void init_javascript(JSRuntime **prt, JSContext **pctx) {
 
 static int process_shadow_midi(JSContext *ctx, JSValue *onInternal, JSValue *onExternal) {
     if (!shadow_ui_midi_shm) return 0;
+    /* Cable-2 (external USB) SysEx accumulator. Single consumer — this function
+     * is the only reader of the ring. Zero-initialised static == the reset
+     * state (len 0, inactive), so no explicit init is needed. A SysEx dump /
+     * Property Exchange reply spans several 4-byte packets; without this ion
+     * would see 3-byte fragments and never a whole message. */
+    static sysex_reassemble_t ext_sx;
     int handled = 0;
     for (int i = 0; i < MIDI_BUFFER_SIZE; i += 4) {
         /* Acquire-load the gate byte: pairs with the producer's release-store
@@ -2554,13 +2561,23 @@ static int process_shadow_midi(JSContext *ctx, JSValue *onInternal, JSValue *onE
 
         /* CIN 0x04-0x07: SysEx, CIN 0x08-0x0E: Note/CC/etc */
         if (cin < 0x04 || cin > 0x0E) continue;
-        uint8_t msg[3] = { shadow_ui_midi_shm[i + 1], shadow_ui_midi_shm[i + 2], shadow_ui_midi_shm[i + 3] };
+        uint8_t d1 = shadow_ui_midi_shm[i + 1], d2 = shadow_ui_midi_shm[i + 2], d3 = shadow_ui_midi_shm[i + 3];
+        uint8_t msg[3] = { d1, d2, d3 };
         handled = 1;
         if (cable == 2) {
             /* Re-lookup onMidiMessageExternal each time in case overtake module replaced it */
             JSValue freshExternal;
             if (getGlobalFunction(ctx, "onMidiMessageExternal", &freshExternal)) {
-                callGlobalFunction(ctx, &freshExternal, msg);
+                int n = sysex_reassemble_feed(&ext_sx, cin, d1, d2, d3);
+                if (n > 0) {
+                    /* whole F0..F7 reassembled */
+                    callGlobalFunctionN(ctx, &freshExternal, ext_sx.buf, n);
+                } else if (n == SYSEX_FEED_NOT_SYSEX) {
+                    /* channel-voice, or a non-terminator common byte: 3-byte path */
+                    callGlobalFunction(ctx, &freshExternal, msg);
+                }
+                /* SYSEX_FEED_INCOMPLETE: consumed into an in-progress message,
+                 * nothing to deliver yet. */
                 JS_FreeValue(ctx, freshExternal);
             }
         } else {
