@@ -23,7 +23,9 @@
 typedef struct {
     unsigned char buf[SYSEX_REASSEMBLE_MAX];
     int len;
-    int active;
+    int active;      /* a message is being accumulated */
+    int overflowed;  /* it overran the buffer: keep owning its trailing packets
+                      * so the terminator is dropped, not leaked as channel-voice */
 } sysex_reassemble_t;
 
 /* Return codes from sysex_reassemble_feed(). */
@@ -36,6 +38,7 @@ enum {
 static inline void sysex_reassemble_init(sysex_reassemble_t *r) {
     r->len = 0;
     r->active = 0;
+    r->overflowed = 0;
 }
 
 /* Feed one USB-MIDI packet: `cin` (low nibble of byte 0) plus its three data
